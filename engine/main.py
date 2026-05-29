@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 from engine.backtest.walkforward import walk_forward_naive  # noqa: E402
 from engine.features.build import build_features  # noqa: E402
 from engine.models.forecast import next_forecast, walk_forward_arima  # noqa: E402
+from engine.models.report import build_report  # noqa: E402
 from engine.models.risk import garch_risk  # noqa: E402
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache"
@@ -103,7 +104,7 @@ def analysis(coin: str, vs: str = "usd") -> dict:
     except Exception:
         pass
 
-    return {
+    payload = {
         "coin": coin,
         "regime": {
             "price": float(last["price"]),
@@ -121,6 +122,8 @@ def analysis(coin: str, vs: str = "usd") -> dict:
         ],
         "disclaimer": "Simulación educativa / demo; no usar para operar capital real.",
     }
+    payload["report"] = build_report(payload)
+    return payload
 
 
 if __name__ == "__main__":

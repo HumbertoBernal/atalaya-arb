@@ -1,5 +1,6 @@
 import { PriceChart } from "@/components/PriceChart";
 import { getAnalysis, getMarket } from "@/lib/engine";
+import { enhanceReport, type LlmStatus } from "@/lib/llm";
 
 export const dynamic = "force-dynamic";
 
@@ -9,12 +10,26 @@ function pct(x: number) {
   return `${(x * 100).toFixed(2)}%`;
 }
 
+const LLM_LABEL: Record<LlmStatus, string> = {
+  deterministic: "determinista (sin LLM)",
+  anthropic: "Claude",
+  openai: "OpenAI",
+};
+
 export default async function Home() {
   let market, analysis, error: string | null = null;
   try {
     [market, analysis] = await Promise.all([getMarket(COIN), getAnalysis(COIN)]);
   } catch (e) {
     error = e instanceof Error ? e.message : "Error desconocido";
+  }
+
+  let report: string | null = null;
+  let llmStatus: LlmStatus = "deterministic";
+  if (analysis?.report) {
+    const enhanced = await enhanceReport(analysis.report);
+    report = enhanced.text;
+    llmStatus = enhanced.status;
   }
 
   return (
@@ -119,11 +134,50 @@ export default async function Home() {
               </table>
             </section>
 
+            {report && (
+              <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5 mb-6">
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-lg font-semibold">Reporte ejecutivo</h2>
+                  <span className="text-xs px-2 py-1 rounded-full bg-neutral-800 text-neutral-300">
+                    {LLM_LABEL[llmStatus]}
+                  </span>
+                </div>
+                <Markdown text={report} />
+              </section>
+            )}
+
             <p className="text-xs text-neutral-500">{analysis!.disclaimer}</p>
           </>
         )}
       </div>
     </main>
+  );
+}
+
+// Mini-render de Markdown (## headings + párrafos). Suficiente para el reporte.
+function Markdown({ text }: { text: string }) {
+  const blocks = text.trim().split(/\n(?=## )/);
+  return (
+    <div className="space-y-3 text-sm text-neutral-300 leading-relaxed">
+      {blocks.map((b, i) => {
+        const isHeading = b.startsWith("## ");
+        const heading = isHeading ? b.slice(3, b.indexOf("\n")) : null;
+        const body = isHeading ? b.slice(b.indexOf("\n") + 1) : b;
+        return (
+          <div key={i}>
+            {heading && <h3 className="text-neutral-100 font-semibold mb-1">{heading}</h3>}
+            {body
+              .trim()
+              .split(/\n\s*\n/)
+              .map((para, j) => (
+                <p key={j} className="mb-1">
+                  {para.trim()}
+                </p>
+              ))}
+          </div>
+        );
+      })}
+    </div>
   );
 }
 

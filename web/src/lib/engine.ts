@@ -34,6 +34,7 @@ export type AnalysisResponse = {
     garch_skill_vs_const: number;
   } | null;
   backtest: { model: string; mae: number; rmse: number; n: number }[];
+  report?: string;
   disclaimer: string;
 };
 
