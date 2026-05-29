@@ -1,6 +1,6 @@
 # Atalaya — Bot de Arbitraje de Bitcoin
 
-**Demo en vivo:** _(ver URL de despliegue)_
+**Demo en vivo:** https://atalaya-arb.vercel.app
 
 Sistema de trading que **detecta oportunidades de arbitraje de BTC en tiempo real** entre múltiples
 exchanges y **simula su ejecución** neta de fees y slippage. "Atalaya" = torre de vigía: el sistema
