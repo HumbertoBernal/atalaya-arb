@@ -1,100 +1,96 @@
-# Crypto Risk Copilot — Coding Challenge MX 2026
+# Atalaya — Bot de Arbitraje de Bitcoin
 
-**Demo en vivo:** https://atalaya-rosy.vercel.app
+**Demo en vivo:** _(ver URL de despliegue)_
 
-Un copiloto de **riesgo y decisión financiera** para criptoactivos. Tesis central:
-no prometemos predecir el precio (es casi un *random walk*), sino **gestionar riesgo,
-entender régimen y construir portafolios** con métodos interpretables y validación honesta.
+Sistema de trading que **detecta oportunidades de arbitraje de BTC en tiempo real** entre múltiples
+exchanges y **simula su ejecución** neta de fees y slippage. "Atalaya" = torre de vigía: el sistema
+vigila divergencias de precio entre mercados y actúa sobre las rentables.
 
-> ⚠️ Simulación educativa / demo. No es asesoría de inversión ni está listo para operar capital real.
+> Simulación educativa / demo. No opera capital real.
 
-## Por qué este enfoque gana
+## El problema
 
-Un "bot de trading" opaco impresiona en superficie pero se rompe ante un jurado técnico.
-Este producto, en cambio, demuestra **juicio cuantitativo**: reporta cuándo un modelo
-*no* aporta valor, valida fuera de muestra y separa lo predecible (riesgo) de lo que no
-(precio). Cubre una vertical full-stack completa de punta a punta.
+BTC se transa en cientos de exchanges independientes; sus precios divergen constantemente. Cuando el
+**ask** de un exchange es menor que el **bid** de otro, existe arbitraje. Pero una oportunidad rentable
+en bruto puede ser negativa tras **fees, slippage y liquidez** — y ahí está la verdadera dificultad.
 
-## Los cuatro pilares
-
-| Pilar | Implementación | Hallazgo honesto |
-|-------|----------------|------------------|
-| **Ingesta** | CoinGecko (4 activos) → caché Parquet | 366 días reales de OHLCV/market cap |
-| **Modelado** | baselines + ARIMA + GARCH(1,1) | Precio ≈ random walk (ARIMA skill +0.7% vs naive) |
-| **Backtest** | walk-forward rolling-origin (5 folds) | Métricas por fold, siempre vs baseline ingenuo |
-| **Explicación** | reporte ejecutivo determinista + AI SDK | Funciona sin LLM; se enriquece con Claude/OpenAI si hay key |
-
-Extra: **portafolio** Markowitz (media-varianza) vs CVaR (riesgo de cola) con CVXPY.
-
-## Arquitectura
+## Cómo funciona
 
 ```
-CoinGecko ──► engine/ingest ──► data/cache (Parquet)
-                                      │
-                 ┌────────────────────┼─────────────────────┐
-            features (sin leakage)  ARIMA/GARCH        portfolio (CVXPY)
-                 └──────────► engine/main.py (FastAPI) ◄──────┘
-                                      │  /market /analysis /portfolio
-                                      ▼
-              web (Next.js SSR) ──► BFF (lib/engine.ts) ──► dashboard
-                                      │  fallback: snapshot.json precomputado
-                                      ▼
-                            lib/llm.ts (AI SDK, opcional) ──► reporte enriquecido
+Exchanges (Coinbase, Kraken, Bitstamp, Gemini)
+        │  REST order books (públicos)
+        ▼
+/api/orderbooks  ── server-side (evita CORS y bloqueos geo), fetch en paralelo
+        │  OrderBook normalizado (bids desc, asks asc, latencia por exchange)
+        ▼
+Cliente (React, polling ~1.5s)
+   ├─ detectOpportunities()  ── cross-exchange ask<bid, ranking por neto
+   ├─ optimalArb()           ── tamaño óptimo por profitabilidad MARGINAL
+   │                            (recorre el book nivel a nivel → slippage y
+   │                             fills parciales nativos)
+   ├─ simulateExecution()    ── respeta saldos de wallet, fills parciales
+   └─ P&L acumulado + historial + balances (estado en el navegador)
 ```
 
-- **`web/`** — Next.js 16, TypeScript, Tailwind, recharts, Vercel AI SDK. Desplegado en Vercel.
-- **`engine/`** — FastAPI + Python 3.12 (pandas, statsmodels, arch, scikit-learn, cvxpy). Gestionado con `uv`.
-- **`db/`** — Supabase Postgres: 10 tablas (ERD), pgvector, RLS server-side. Migraciones en `db/migrations/`.
-- **`data/cache/`** — snapshots Parquet para reproducibilidad y demo sin dependencia de API en vivo.
+### Decisiones técnicas clave
 
-## Cómo correr (local)
+- **Simulador en el cliente + fetch server-side.** El navegador mantiene el estado (wallets, P&L,
+  historial) y hace polling a un Route Handler que trae los order books. Así la demo **funciona en vivo
+  para el jurado sin depender de un backend con estado** ni de credenciales, y evita CORS/bloqueos geo.
+- **Tamaño óptimo por profitabilidad marginal.** En vez de ejecutar un volumen fijo, `optimalArb`
+  recorre asks y bids nivel por nivel y ejecuta **mientras el ingreso marginal de venta (neto de fee)
+  supere al costo marginal de compra**. Esto incorpora slippage y órdenes parciales de forma nativa y
+  maximiza la ganancia neta sin operar volumen no rentable.
+- **Net-first.** Toda oportunidad se evalúa neta de fees taker (por exchange) y slippage real. Las que
+  son positivas en bruto pero negativas en neto se marcan y **no se ejecutan**.
+- **Tier de fees configurable.** Retail / Pro / VIP / Maker. Con fees retail el arbitraje BTC/USD casi
+  nunca es neto-positivo (mercados eficientes); a fees HFT aparecen ejecuciones — exactamente por qué el
+  arbitraje real es un juego de baja latencia y alto volumen.
+- **Gestión de riesgo.** Tope de notional por operación (`MAX_TRADE_BTC`), fills parciales por liquidez
+  y por saldo de wallet, y rechazo de operaciones no rentables.
+
+## Exchanges y fees
+
+Order books públicos de **Coinbase, Kraken, Bitstamp y Gemini** (BTC/USD, sin API key). Fees taker
+aproximados y públicos por exchange (en `src/lib/arb/config.ts`), documentados como supuestos.
+
+## Estructura
+
+```
+web/src/
+  app/api/orderbooks/route.ts   # BFF: fetch paralelo de order books
+  app/page.tsx                  # render del dashboard
+  components/arb/ArbDashboard.tsx  # UI tiempo real (polling, KPIs, tablas, P&L)
+  lib/arb/
+    exchanges.ts   # conectores + normalización
+    engine.ts      # detección, optimalArb, simulación (puro, testeable)
+    config.ts      # exchanges, fees, parámetros
+    types.ts
+scripts/test-arb.ts             # test de humo con order books reales
+```
+
+## Cómo correr
 
 ```bash
-# 1) Motor cuant
-cd engine
-uv run uvicorn main:app --port 8000        # http://127.0.0.1:8000/health
-
-# 2) App web (otra terminal)
 cd web
 pnpm install
-ENGINE_URL=http://127.0.0.1:8000 pnpm dev   # http://localhost:3000
+pnpm dev            # http://localhost:3000
+pnpm dlx tsx scripts/test-arb.ts   # test de humo del motor
 ```
 
-Sin el engine, el web cae al snapshot precomputado (`web/src/data/snapshot.json`) y
-sigue mostrando datos reales — la regla de oro: **todo lo pesado se precalcula**.
+## Qué demuestra (criterios del jurado)
 
-### Variables de entorno (`web/.env.local`)
+- **Velocidad:** fetch paralelo de exchanges; latencia por exchange y del server visibles en la UI.
+- **Precisión neta:** fees por exchange + slippage por order book; rechazo de net-negativos.
+- **Robustez:** fills parciales, restricciones de wallet, exchanges offline tolerados, tope de riesgo.
+- **Estrategia:** ranking de oportunidades y tamaño óptimo por profitabilidad marginal.
+- **Arquitectura/código:** TypeScript tipado, lógica pura separada de la UI, testeable.
+- **UI:** mercado en vivo, oportunidades, operaciones, P&L acumulado y balances en tiempo real.
 
-```
-NEXT_PUBLIC_SUPABASE_URL=...        # configurado
-NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=...
-ENGINE_URL=http://127.0.0.1:8000
-ANTHROPIC_API_KEY=                  # opcional: activa reporte con Claude
-OPENAI_API_KEY=                     # opcional: activa reporte con OpenAI
-```
+## Limitaciones honestas
 
-## Guion de demo (90 segundos)
-
-1. **Régimen** — tarjetas: precio, régimen (alcista/bajista), volatilidad, drawdown.
-2. **Gráfica** — un año de precio real.
-3. **Riesgo (GARCH)** — vol anualizada + VaR 95% + forecast de volatilidad. *"El valor está aquí, no en adivinar el precio."*
-4. **Forecast honesto** — ARIMA apenas bate al naive → prueba de no-overfitting.
-5. **Portafolio** — Markowitz vs CVaR: el conservador concentra, el otro diversifica.
-6. **Reporte ejecutivo** — narrativa auto-generada con limitaciones explícitas.
-
-## Validación y honestidad
-
-- **Walk-forward** (no entrenar con futuro), siempre contra baseline ingenuo.
-- Reportamos skill negativo/marginal cuando ocurre — sin inflar.
-- Disclaimers regulatorios (activos virtuales MX): lenguaje de simulación, no de asesoría.
-
-## Limitaciones
-
-- Horizonte y muestra acotados (1 año diario); resultados varían por régimen.
-- GARCH/ARIMA sensibles al periodo; no prometen alpha de timing.
-- Portafolio sobre 4 activos como sandbox, no universo completo.
-
-## Próximos pasos (con más tiempo)
-
-Persistencia de corridas a Supabase (service role), challenger profundo (LSTM/TFT) como
-contraste, embeddings en pgvector para memoria documental, y más horizontes de backtest.
+- Polling (~1.5s), no WebSocket de baja latencia (HFT real opera en microsegundos). Suficiente para la
+  demo; la arquitectura admite cambiar a WebSocket.
+- Pares BTC/USD para comparabilidad; no se modela el tiempo real de retiro on-chain entre exchanges
+  (el arbitraje "real" requiere inventario pre-posicionado, que es justo lo que simulamos).
+- Fees taker aproximados por tier; no incluye descuentos personalizados.
