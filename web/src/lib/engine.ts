@@ -42,6 +42,21 @@ import snapshot from "@/data/snapshot.json";
 
 // Intenta el engine vivo; si no responde (p. ej. en producción sin engine
 // hosteado), cae al snapshot precomputado. Regla de oro: precomputar lo pesado.
+export type PortfolioLeg = {
+  method: string;
+  weights: Record<string, number>;
+  exp_return_annual: number;
+  vol_annual: number;
+  sharpe: number;
+};
+
+export type PortfolioResponse = {
+  assets: string[];
+  n_obs: number;
+  markowitz: PortfolioLeg;
+  cvar: PortfolioLeg;
+};
+
 async function get<T>(path: string, fallback: T): Promise<T> {
   try {
     const res = await fetch(`${ENGINE_URL}${path}`, {
@@ -59,3 +74,5 @@ export const getMarket = (coin: string) =>
   get<MarketResponse>(`/market/${coin}`, snapshot.market as MarketResponse);
 export const getAnalysis = (coin: string) =>
   get<AnalysisResponse>(`/analysis/${coin}`, snapshot.analysis as AnalysisResponse);
+export const getPortfolio = () =>
+  get<PortfolioResponse>(`/portfolio`, (snapshot as { portfolio: PortfolioResponse }).portfolio);

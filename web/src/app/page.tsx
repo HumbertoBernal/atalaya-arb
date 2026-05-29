@@ -1,5 +1,5 @@
 import { PriceChart } from "@/components/PriceChart";
-import { getAnalysis, getMarket } from "@/lib/engine";
+import { getAnalysis, getMarket, getPortfolio, type PortfolioLeg } from "@/lib/engine";
 import { enhanceReport, type LlmStatus } from "@/lib/llm";
 
 export const dynamic = "force-dynamic";
@@ -17,9 +17,13 @@ const LLM_LABEL: Record<LlmStatus, string> = {
 };
 
 export default async function Home() {
-  let market, analysis, error: string | null = null;
+  let market, analysis, portfolio, error: string | null = null;
   try {
-    [market, analysis] = await Promise.all([getMarket(COIN), getAnalysis(COIN)]);
+    [market, analysis, portfolio] = await Promise.all([
+      getMarket(COIN),
+      getAnalysis(COIN),
+      getPortfolio(),
+    ]);
   } catch (e) {
     error = e instanceof Error ? e.message : "Error desconocido";
   }
@@ -134,6 +138,20 @@ export default async function Home() {
               </table>
             </section>
 
+            {portfolio && (
+              <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5 mb-8">
+                <h2 className="text-lg font-semibold mb-1">Portafolio sandbox ({portfolio.assets.length} activos)</h2>
+                <p className="text-sm text-neutral-400 mb-4">
+                  Dos enfoques sobre {portfolio.n_obs} días de retornos: <strong>Markowitz</strong> (media-varianza)
+                  vs <strong>CVaR</strong> (riesgo de cola). Pesos long-only, optimizados con CVXPY.
+                </p>
+                <div className="grid md:grid-cols-2 gap-4">
+                  <PortfolioCard leg={portfolio.markowitz} title="Markowitz" />
+                  <PortfolioCard leg={portfolio.cvar} title="CVaR (cola 95%)" />
+                </div>
+              </section>
+            )}
+
             {report && (
               <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5 mb-6">
                 <div className="flex items-center justify-between mb-3">
@@ -151,6 +169,33 @@ export default async function Home() {
         )}
       </div>
     </main>
+  );
+}
+
+function PortfolioCard({ leg, title }: { leg: PortfolioLeg; title: string }) {
+  const sorted = Object.entries(leg.weights).sort((a, b) => b[1] - a[1]);
+  return (
+    <div className="rounded-lg border border-neutral-800 bg-neutral-950/50 p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="font-semibold">{title}</h3>
+        <span className="text-xs text-neutral-400">
+          Sharpe {leg.sharpe.toFixed(2)} · vol {(leg.vol_annual * 100).toFixed(0)}%
+        </span>
+      </div>
+      <div className="space-y-2">
+        {sorted.map(([asset, w]) => (
+          <div key={asset}>
+            <div className="flex justify-between text-xs mb-0.5">
+              <span className="capitalize text-neutral-300">{asset}</span>
+              <span className="text-neutral-400">{(w * 100).toFixed(0)}%</span>
+            </div>
+            <div className="h-2 rounded-full bg-neutral-800 overflow-hidden">
+              <div className="h-full bg-indigo-500" style={{ width: `${Math.max(w * 100, 0)}%` }} />
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 

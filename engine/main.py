@@ -17,8 +17,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 from engine.backtest.walkforward import walk_forward_naive  # noqa: E402
 from engine.features.build import build_features  # noqa: E402
 from engine.models.forecast import next_forecast, walk_forward_arima  # noqa: E402
+from engine.models.portfolio import optimize as optimize_portfolio  # noqa: E402
 from engine.models.report import build_report  # noqa: E402
 from engine.models.risk import garch_risk  # noqa: E402
+
+DEFAULT_COINS = ["bitcoin", "ethereum", "solana", "binancecoin"]
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache"
 
@@ -124,6 +127,12 @@ def analysis(coin: str, vs: str = "usd") -> dict:
     }
     payload["report"] = build_report(payload)
     return payload
+
+
+@app.get("/portfolio")
+def portfolio(coins: str = ",".join(DEFAULT_COINS)) -> dict:
+    """Optimización Markowitz + CVaR sobre los activos indicados (coma-separados)."""
+    return optimize_portfolio([c.strip() for c in coins.split(",") if c.strip()])
 
 
 if __name__ == "__main__":
