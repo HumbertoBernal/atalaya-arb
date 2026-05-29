@@ -26,11 +26,24 @@ export type AnalysisResponse = {
   disclaimer: string;
 };
 
-async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${ENGINE_URL}${path}`, { cache: "no-store" });
-  if (!res.ok) throw new Error(`Engine ${res.status}: ${path}`);
-  return res.json() as Promise<T>;
+import snapshot from "@/data/snapshot.json";
+
+// Intenta el engine vivo; si no responde (p. ej. en producción sin engine
+// hosteado), cae al snapshot precomputado. Regla de oro: precomputar lo pesado.
+async function get<T>(path: string, fallback: T): Promise<T> {
+  try {
+    const res = await fetch(`${ENGINE_URL}${path}`, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(2500),
+    });
+    if (!res.ok) throw new Error(`Engine ${res.status}`);
+    return (await res.json()) as T;
+  } catch {
+    return fallback;
+  }
 }
 
-export const getMarket = (coin: string) => get<MarketResponse>(`/market/${coin}`);
-export const getAnalysis = (coin: string) => get<AnalysisResponse>(`/analysis/${coin}`);
+export const getMarket = (coin: string) =>
+  get<MarketResponse>(`/market/${coin}`, snapshot.market as MarketResponse);
+export const getAnalysis = (coin: string) =>
+  get<AnalysisResponse>(`/analysis/${coin}`, snapshot.analysis as AnalysisResponse);
