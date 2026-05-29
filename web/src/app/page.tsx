@@ -51,6 +51,47 @@ export default async function Home() {
               <PriceChart data={market!.series} />
             </section>
 
+            {analysis!.risk && (
+              <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5 mb-8">
+                <h2 className="text-lg font-semibold mb-1">Riesgo (GARCH 1,1)</h2>
+                <p className="text-sm text-neutral-400 mb-4">
+                  El precio es casi un random walk; la <strong>volatilidad</strong> sí tiene estructura
+                  predecible. Aquí está el valor del copiloto: gestionar riesgo, no adivinar precio.
+                </p>
+                <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                  <Card label="Volatilidad anualizada" value={pct(analysis!.risk.sigma_annualized)} />
+                  <Card label="VaR 95% (1 día)" value={pct(analysis!.risk.var_95_1d)} negative />
+                  <Card
+                    label="Vol. pronosticada 7d (prom)"
+                    value={pct(
+                      analysis!.risk.forecast_vol_7d.reduce((a, b) => a + b, 0) /
+                        analysis!.risk.forecast_vol_7d.length,
+                    )}
+                  />
+                </div>
+              </section>
+            )}
+
+            {analysis!.forecast && (
+              <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5 mb-8">
+                <h2 className="text-lg font-semibold mb-1">Forecast de precio (ARIMA) — honesto</h2>
+                <p className="text-sm text-neutral-400 mb-3">
+                  Skill vs naive (random walk):{" "}
+                  <span className={analysis!.forecast.skill_vs_naive > 0 ? "text-emerald-400" : "text-rose-400"}>
+                    {(analysis!.forecast.skill_vs_naive * 100).toFixed(2)}%
+                  </span>
+                  . Un skill cercano a 0 confirma que el precio diario es casi impredecible —
+                  reportarlo sin inflar es metodológicamente correcto.
+                </p>
+                <p className="text-sm text-neutral-300">
+                  Proyección 7d:{" "}
+                  {analysis!.forecast.horizon_7d
+                    .map((v) => `$${v.toLocaleString(undefined, { maximumFractionDigits: 0 })}`)
+                    .join(" → ")}
+                </p>
+              </section>
+            )}
+
             <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5 mb-6">
               <h2 className="text-lg font-semibold mb-1">Backtest walk-forward (baselines)</h2>
               <p className="text-sm text-neutral-400 mb-4">

@@ -22,6 +22,17 @@ export type AnalysisResponse = {
     drawdown_30d: number;
     regime: string;
   };
+  forecast: {
+    horizon_7d: number[];
+    skill_vs_naive: number;
+    models: { model: string; mae: number; rmse: number }[];
+  } | null;
+  risk: {
+    sigma_annualized: number;
+    var_95_1d: number;
+    forecast_vol_7d: number[];
+    garch_skill_vs_const: number;
+  } | null;
   backtest: { model: string; mae: number; rmse: number; n: number }[];
   disclaimer: string;
 };

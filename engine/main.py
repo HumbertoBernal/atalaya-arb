@@ -16,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from engine.backtest.walkforward import walk_forward_naive  # noqa: E402
 from engine.features.build import build_features  # noqa: E402
+from engine.models.forecast import next_forecast, walk_forward_arima  # noqa: E402
+from engine.models.risk import garch_risk  # noqa: E402
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache"
 
@@ -70,7 +72,37 @@ def analysis(coin: str, vs: str = "usd") -> dict:
     feats = build_features(df)
     last = feats.dropna(subset=["log_ret"]).iloc[-1]
 
-    res = walk_forward_naive(df["price"].dropna(), n_splits=5)
+    price = df["price"].dropna()
+    res = walk_forward_naive(price, n_splits=5)
+
+    # Modelo principal (forecast) — comparado honestamente vs naive
+    forecast = None
+    try:
+        fc = walk_forward_arima(price, n_splits=5)
+        forecast = {
+            "horizon_7d": next_forecast(price, steps=7),
+            "skill_vs_naive": fc["arima"].skill_vs_naive,
+            "models": [
+                {"model": r.model, "mae": r.mae, "rmse": r.rmse}
+                for r in fc.values()
+            ],
+        }
+    except Exception:
+        pass
+
+    # Riesgo — GARCH(1,1)
+    risk = None
+    try:
+        r = garch_risk(price)
+        risk = {
+            "sigma_annualized": r.sigma_annualized,
+            "var_95_1d": r.var_95_1d,
+            "forecast_vol_7d": r.forecast_vol_7d,
+            "garch_skill_vs_const": r.garch_skill_vs_const,
+        }
+    except Exception:
+        pass
+
     return {
         "coin": coin,
         "regime": {
@@ -81,6 +113,8 @@ def analysis(coin: str, vs: str = "usd") -> dict:
             "drawdown_30d": float(last["drawdown_30"]),
             "regime": "alcista" if last["regime_bull"] == 1 else "bajista",
         },
+        "forecast": forecast,
+        "risk": risk,
         "backtest": [
             {"model": r.model, "mae": r.mae, "rmse": r.rmse, "n": r.n_preds}
             for r in res.values()
