@@ -1,6 +1,6 @@
 # Crypto Risk Copilot — Coding Challenge MX 2026
 
-**Demo en vivo:** https://coding-challenge-mx.vercel.app
+**Demo en vivo:** https://atalaya-rosy.vercel.app
 
 Un copiloto de **riesgo y decisión financiera** para criptoactivos. Tesis central:
 no prometemos predecir el precio (es casi un *random walk*), sino **gestionar riesgo,
