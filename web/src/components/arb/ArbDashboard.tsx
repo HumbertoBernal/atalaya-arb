@@ -291,6 +291,12 @@ export function ArbDashboard() {
               Detección en tiempo real (WebSocket) de divergencias entre exchanges, ejecución simulada neta
               de fees, slippage, latencia y retiros.
             </p>
+            <a
+              href="/como-funciona.html"
+              className="inline-block mt-2 text-sm text-indigo-400 hover:text-indigo-300"
+            >
+              Cómo funciona y la matemática →
+            </a>
           </div>
           <div className="flex items-center gap-2">
             <button

@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Atalaya — Cómo funciona y la matemática detrás</title>
+<script>
+  MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['$$', '$$']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<style>
+  :root {
+    --bg: #0a0a0b; --panel: #15151a; --border: #26262e; --text: #e6e6ea;
+    --muted: #9a9aa6; --accent: #818cf8; --green: #34d399; --rose: #fb7185; --amber: #fbbf24;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); line-height: 1.65; font-size: 16px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 40px 24px 96px; }
+  a.back { color: var(--accent); text-decoration: none; font-size: 0.9rem; }
+  h1 { font-size: 2.1rem; margin: 12px 0 4px; letter-spacing: -0.02em; }
+  h1 .sub { color: var(--accent); }
+  h2 { font-size: 1.4rem; margin: 44px 0 12px; padding-top: 16px; border-top: 1px solid var(--border); letter-spacing: -0.01em; }
+  h3 { font-size: 1.1rem; margin: 26px 0 8px; color: var(--accent); }
+  p, li { color: #d6d6dd; }
+  .lead { color: var(--muted); font-size: 1.05rem; }
+  a { color: var(--accent); }
+  code { background: #1e1e26; padding: 1px 6px; border-radius: 5px; font-size: 0.88em;
+    font-family: "SF Mono", Menlo, Consolas, monospace; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 18px 22px; margin: 18px 0; }
+  .formula { background: #101016; border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 10px; padding: 4px 20px; margin: 16px 0; overflow-x: auto; }
+  .pill { display: inline-block; font-size: 0.75rem; padding: 2px 10px; border-radius: 999px;
+    background: #1e1b3a; color: var(--accent); border: 1px solid #353159; margin-right: 6px; }
+  table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; }
+  .green { color: var(--green); } .rose { color: var(--rose); } .muted { color: var(--muted); }
+  .mono { font-family: "SF Mono", Menlo, Consolas, monospace; }
+  .step { display: flex; gap: 14px; margin: 12px 0; }
+  .step .n { flex: 0 0 30px; height: 30px; border-radius: 8px; background: #1e1b3a; color: var(--accent);
+    display: grid; place-items: center; font-weight: 700; border: 1px solid #353159; }
+  .footer { margin-top: 52px; color: var(--muted); font-size: 0.85rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <a class="back" href="/">← Volver al dashboard</a>
+  <h1>Atalaya <span class="sub">· Cómo funciona</span></h1>
+  <p class="lead">El sistema y la matemática que decide qué ejecutar.</p>
+  <p><span class="pill">Demo</span><a href="/">dashboard en vivo</a> &nbsp;·&nbsp;
+     <span class="pill">Repo</span><a href="https://github.com/HumbertoBernal/atalaya-arb">github.com/HumbertoBernal/atalaya-arb</a></p>
+
+  <h2>1 · El problema en una frase</h2>
+  <p>BTC se transa en cientos de exchanges independientes; sus precios divergen. Cuando el
+    <strong>ask</strong> de un exchange es menor que el <strong>bid</strong> de otro, hay arbitraje.
+    Lo difícil no es <em>verlo</em>, sino decidir si tras <strong>fees, slippage, liquidez y latencia</strong>
+    sigue siendo rentable.</p>
+
+  <h2>2 · Arquitectura</h2>
+  <div class="panel"><div class="mono" style="font-size:0.82rem;white-space:pre;overflow-x:auto;color:var(--muted)">5 exchanges (Coinbase, Kraken, Bitstamp, Gemini, Bitfinex)
+   │  WebSocket L2 (libro completo, 4 venues)   │  REST (Coinbase + fallback)
+   ▼                                            ▼
+LiveFeed + L2Feed (cliente) ──► merge (L2 depth / REST) ──► motor
+   ├─ detectOpportunities()   cross-exchange, ranking por neto
+   ├─ optimalArb()            tamaño óptimo por profitabilidad marginal
+   ├─ frictionCosts()         latencia (adverse selection) + retiro amortizado
+   ├─ evaluateRisk()          circuit breaker
+   ├─ detectTriangular()      ciclos USD→BTC→ETH→USD
+   ├─ rebalance()             repone inventario agotado
+   └─ simulateExecution()     fills parciales + balances + P&L</div></div>
+
+  <h2>3 · La matemática</h2>
+
+  <h3>3.1 Detección y condición neta</h3>
+  <p>Comprar en \(e_1\) y vender en \(e_2\) es rentable <em>en bruto</em> si \(b^{e_2}_1 > a^{e_1}_1\).
+    Pero la condición real es la <strong>neta</strong>, por BTC:</p>
+  <div class="formula">$$ \pi_{\text{neto}} = b^{e_2}_1\,(1-f_{e_2}) - a^{e_1}_1\,(1+f_{e_1}) $$</div>
+  <p>Como los fees (\(0.5\%\!-\!1.2\%\)) son 30–100× el spread típico (1–3 bps), <strong>casi toda
+    oportunidad bruta es neto-negativa</strong>. Detectarlo y no operar es justo el criterio #2.</p>
+
+  <h3>3.2 Slippage: caminar el order book</h3>
+  <p>El mejor precio solo existe para la cantidad del primer nivel. Comprar \(Q\) recorre los asks:</p>
+  <div class="formula">$$ C(Q) = \sum_i a_i\,q_i,\quad \sum_i q_i = Q;\qquad \bar a = C(Q)/Q $$</div>
+  <p>El precio promedio \(\bar a\) es peor que \(a_1\) — esa degradación es el slippage, modelado sobre
+    el libro <strong>L2 real</strong> (mantenido por WebSocket).</p>
+
+  <h3>3.3 Tamaño óptimo por profitabilidad marginal</h3>
+  <p>No operamos un volumen fijo: recorremos ambos libros y ejecutamos mientras la unidad marginal sea rentable.</p>
+  <div class="formula">$$ Q^{\star} = \max\Big\{ Q : b(Q)\,(1-f_{e_2}) > a(Q)\,(1+f_{e_1}) \Big\},\quad Q^\star \le Q_{\max} $$</div>
+  <p>Esto incorpora slippage y fills parciales de forma nativa y maximiza la ganancia neta total.</p>
+
+  <h3>3.4 Fricciones reales: latencia y retiro</h3>
+  <p>Más allá de fees y slippage (exigidos por el enunciado):</p>
+  <div class="formula">$$ \text{latencia} = \bar a\,\sigma_{\text{seg}}\sqrt{t_{\text{lat}}}\cdot Q \qquad\quad \text{retiro} = \frac{\phi_{e_1}+\phi_{e_2}}{N_{\text{reb}}}\cdot \bar a $$</div>
+  <p>La latencia se modela como un movimiento adverso de \(1\sigma\) durante la ventana de ejecución
+    (<em>adverse selection</em>); el withdrawal fee \(\phi\) se amortiza entre operaciones del rebalanceo.</p>
+
+  <h3>3.5 Maker vs Taker</h3>
+  <p>Las órdenes <strong>maker</strong> (límite) pagan fees mucho menores que las <strong>taker</strong>
+    — la vía de un retail listo. El costo: solo se llenan con probabilidad \(p\) antes de que el spread
+    se cierre, así que el volumen esperado es \(Q_{\text{exe}} = p\cdot Q^\star\) (riesgo de ejecución).</p>
+
+  <h3>3.6 Balances y rebalanceo</h3>
+  <p>Cada arbitraje compra y vende la misma cantidad de BTC → el inventario total de BTC es constante y
+    la ganancia queda en USD. Cuando un venue agota su USD o BTC, su ruta muere; el <strong>rebalanceo</strong>
+    redistribuye el inventario pagando el fee de red. El P&amp;L realizado es:</p>
+  <div class="formula">$$ \text{P\&L} = \sum_k \Pi_k - \text{costos de rebalanceo} $$</div>
+
+  <h3>3.7 Arbitraje triangular y estadístico</h3>
+  <p><strong>Triangular</strong>: ciclo intra-exchange \(\text{USD}\to\text{BTC}\to\text{ETH}\to\text{USD}\);
+    hay arbitraje si el producto de las conversiones (neto de fee) supera 1.
+    <strong>Estadístico</strong>: z-score del spread vs su media móvil — \(|z|\) alto señala un spread inusual
+    (posible mean-reversion).</p>
+
+  <h2>4 · Ejemplo trabajado</h2>
+  <p>El ejemplo del enunciado (fee \(0.1\%\)):</p>
+  <div class="formula">$$ \pi_{\text{neto}} = 70{,}250(1-0.001) - 70{,}000(1+0.001) = \mathbf{+\$109.75}\ \text{por BTC} $$</div>
+  <p class="muted">Ahí el spread bruto era 36 bps, enorme. En BTC/USD entre majors es 1–3 bps y rara vez
+    sobrevive a fees retail.</p>
+
+  <h2>5 · Honestidad: por qué NO usamos ML</h2>
+  <div class="panel">
+    <p style="margin-top:0">Probamos un predictor online (regresión logística) para anticipar si una oportunidad
+      persistiría. Medimos su rendimiento con rigor: la <strong>balanced accuracy fue ~50%</strong> (= azar),
+      porque la microdinámica del spread a escala de ~1s no es predecible con estas features.</p>
+    <p style="margin-bottom:0">Por eso <strong>descartamos el ML</strong> y mantuvimos el motor determinista.
+      Predecir el precio en arbitraje, además, añadiría latencia — el juego equivocado. Saber cuándo
+      <em>no</em> usar ML, con evidencia en mano, es parte del dominio técnico.</p>
+  </div>
+
+  <h2>6 · El hallazgo central</h2>
+  <div class="panel">
+    <p style="margin:0">Con fees retail, el arbitraje BTC/USD entre majors es <strong class="rose">estructuralmente
+      no rentable</strong> (mercados eficientes). El bot lo detecta y <strong>correctamente no opera</strong>.
+      A escala HFT (tiers VIP/Maker) los micro-spreads se vuelven capturables. Esa honestidad — no fingir
+      alpha — es el diferenciador.</p>
+  </div>
+
+  <div class="footer">
+    <p>Simulación educativa / demo — no opera capital real. Detección a ~1.2s; libro L2 en tiempo real por
+      WebSocket; fallback a REST. <a href="/">← Volver al dashboard</a></p>
+  </div>
+
+</div>
+</body>
+</html>
