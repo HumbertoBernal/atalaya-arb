@@ -47,13 +47,13 @@ export function ArbDashboard() {
         <header className="mb-6 flex flex-wrap items-end justify-between gap-4">
           <div>
             <h1 className="text-2xl md:text-3xl font-bold tracking-tight">
-              Atalaya <span className="text-amber-400">· Arbitraje BTC</span>
+              Atalaya <span className="text-cyan-400">· Arbitraje BTC</span>
             </h1>
             <p className="text-neutral-400 text-sm mt-1 max-w-2xl">
               Detección en tiempo real (WebSocket) de divergencias entre exchanges, ejecución simulada neta
               de fees, slippage, latencia y retiros.
             </p>
-            <a href="/como-funciona.html" className="inline-block mt-2 text-sm text-amber-400 hover:text-amber-300">
+            <a href="/como-funciona.html" className="inline-block mt-2 text-sm text-cyan-400 hover:text-cyan-300">
               Cómo funciona y la matemática →
             </a>
           </div>
@@ -299,7 +299,7 @@ function Panel({ title, subtitle, right, className = "", children }: {
 function SectionHeader({ n, title, className = "" }: { n: string; title: string; className?: string }) {
   return (
     <div className={`flex items-center gap-3 mb-4 ${className}`}>
-      <span className="font-mono text-xs text-amber-400/70">{n}</span>
+      <span className="font-mono text-xs text-cyan-400/70">{n}</span>
       <h2 className="text-sm uppercase tracking-[0.25em] text-neutral-400">{title}</h2>
       <span className="flex-1 h-px bg-neutral-800" />
     </div>
@@ -311,7 +311,7 @@ function Toggle({ active, onClick, children }: { active: boolean; onClick: () =>
     <button
       onClick={onClick}
       className={`px-2.5 py-1.5 rounded-full border text-sm transition-colors ${
-        active ? "border-amber-400 bg-amber-500/15 text-amber-200" : "border-neutral-700 text-neutral-300 hover:border-neutral-500"
+        active ? "border-cyan-400 bg-cyan-500/15 text-cyan-200" : "border-neutral-700 text-neutral-300 hover:border-neutral-500"
       }`}
     >
       {children}

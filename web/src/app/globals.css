@@ -3,7 +3,7 @@
 :root {
   --background: #ffffff;
   --foreground: #171717;
-  --accent: #d4a72c; /* dorado sobrio: color de marca (≠ semántica P&L) */
+  --accent: #22d3ee; /* cyan frío: color de marca (≠ semántica verde/rojo del P&L) */
   --pos: #34d399;
   --neg: #fb7185;
 }
