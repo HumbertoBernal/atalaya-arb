@@ -18,19 +18,32 @@ en bruto puede ser negativa tras **fees, slippage y liquidez** — y ahí está 
 
 ```
 Exchanges (Coinbase, Kraken, Bitstamp, Gemini)
-        │  REST order books (públicos)
+   │  WebSocket (CB/KR/BS, top-of-book en vivo)     │  REST (profundidad)
+   ▼                                                ▼
+LiveFeed (cliente)                          /api/orderbooks · /api/triangular
+   │  mejor bid/ask sub-segundo                     │  server-side (evita CORS/geo)
+   └───────────────► merge (WS top + REST depth) ◄──┘
         ▼
-/api/orderbooks  ── server-side (evita CORS y bloqueos geo), fetch en paralelo
-        │  OrderBook normalizado (bids desc, asks asc, latencia por exchange)
-        ▼
-Cliente (React, polling ~1.5s)
+Cliente (React, ~1.2s + push WS)
    ├─ detectOpportunities()  ── cross-exchange ask<bid, ranking por neto
    ├─ optimalArb()           ── tamaño óptimo por profitabilidad MARGINAL
-   │                            (recorre el book nivel a nivel → slippage y
-   │                             fills parciales nativos)
+   │                            (recorre el book → slippage y fills parciales)
+   ├─ frictionCosts()        ── adverse selection por latencia + retiro amortizado
+   ├─ evaluateRisk()         ── circuit breaker (stale / spread anómalo / drawdown)
+   ├─ detectTriangular()     ── ciclos intra-exchange USD/BTC/ETH
    ├─ simulateExecution()    ── respeta saldos de wallet, fills parciales
    └─ P&L acumulado + historial + balances (estado en el navegador)
 ```
+
+### Capacidades
+
+- **Feeds WebSocket** (Coinbase, Kraken, Bitstamp) para best bid/ask sub-segundo, con reconexión y
+  fallback a REST; Gemini por REST. La profundidad para sizing viene del REST.
+- **Cálculo neto completo**: fees taker por exchange + slippage (order book real) + **adverse selection
+  por latencia de red** + **withdrawal fee amortizado** (rebalanceo).
+- **Circuit breaker**: detiene la ejecución ante datos stale, spread anómalo (dato corrupto) o drawdown.
+- **Arbitraje triangular** intra-exchange (Coinbase USD/BTC/ETH), ambas direcciones del ciclo.
+- **Tests**: `pnpm test` (13 casos del motor, deterministas).
 
 ### Decisiones técnicas clave
 
@@ -61,11 +74,16 @@ web/src/
   app/api/orderbooks/route.ts   # BFF: fetch paralelo de order books
   app/page.tsx                  # render del dashboard
   components/arb/ArbDashboard.tsx  # UI tiempo real (polling, KPIs, tablas, P&L)
+  app/api/triangular/route.ts   # BFF: 3 pares de Coinbase para triangular
   lib/arb/
-    exchanges.ts   # conectores + normalización
-    engine.ts      # detección, optimalArb, simulación (puro, testeable)
-    config.ts      # exchanges, fees, parámetros
+    exchanges.ts   # conectores REST + normalización
+    livefeed.ts    # feeds WebSocket (cliente) + reconexión/fallback
+    engine.ts      # detección, optimalArb, fricción, simulación (puro, testeable)
+    risk.ts        # circuit breaker
+    triangular.ts  # arbitraje triangular intra-exchange
+    config.ts      # exchanges, fees, withdrawal, latencia, riesgo
     types.ts
+scripts/test-engine.ts          # tests unitarios (pnpm test)
 scripts/test-arb.ts             # test de humo con order books reales
 ```
 
@@ -75,7 +93,7 @@ scripts/test-arb.ts             # test de humo con order books reales
 cd web
 pnpm install
 pnpm dev            # http://localhost:3000
-pnpm dlx tsx scripts/test-arb.ts   # test de humo del motor
+pnpm test           # tests unitarios del motor (13 casos)
 ```
 
 ## Qué demuestra (criterios del jurado)
@@ -89,8 +107,9 @@ pnpm dlx tsx scripts/test-arb.ts   # test de humo del motor
 
 ## Limitaciones honestas
 
-- Polling (~1.5s), no WebSocket de baja latencia (HFT real opera en microsegundos). Suficiente para la
-  demo; la arquitectura admite cambiar a WebSocket.
-- Pares BTC/USD para comparabilidad; no se modela el tiempo real de retiro on-chain entre exchanges
-  (el arbitraje "real" requiere inventario pre-posicionado, que es justo lo que simulamos).
-- Fees taker aproximados por tier; no incluye descuentos personalizados.
+- WebSocket para best bid/ask (Coinbase/Kraken/Bitstamp); la **profundidad** se refresca por REST
+  (~1.2s). El HFT real opera en microsegundos y mantiene el libro completo por WS.
+- Gemini permanece en REST (su feed L2 requiere reconstruir el libro; se priorizó robustez de la demo).
+- Pares BTC/USD (y BTC/ETH/USD para el triangular). El arbitraje "real" requiere inventario
+  pre-posicionado, que es justo lo que simulamos.
+- Fees, withdrawal y latencia son aproximados y públicos por exchange; no incluye descuentos personalizados.

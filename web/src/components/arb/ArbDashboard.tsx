@@ -11,14 +11,17 @@ import {
 } from "recharts";
 import { EXCHANGE_LABEL, INITIAL_BTC, INITIAL_USD, TAKER_FEE } from "@/lib/arb/config";
 import { detectOpportunities, simulateExecution } from "@/lib/arb/engine";
+import { LiveFeed, type FeedStatus } from "@/lib/arb/livefeed";
+import { evaluateRisk, sanitizeOpportunities, type RiskState } from "@/lib/arb/risk";
+import { detectTriangular, type TriBooks, type TriResult } from "@/lib/arb/triangular";
 import type { OrderBook, OrderBooks, Opportunity, Trade, Wallet } from "@/lib/arb/types";
 
-const POLL_MS = 1500;
+const POLL_MS = 1200;
 const FEE_TIERS = [
-  { id: "retail", label: "Retail", mult: 1, note: "fees minoristas (0.26–0.6%)" },
-  { id: "pro", label: "Pro", mult: 0.4, note: "tier por volumen" },
-  { id: "vip", label: "VIP / HFT", mult: 0.1, note: "alto volumen" },
-  { id: "maker", label: "Maker 0%", mult: 0, note: "rebate de market maker" },
+  { id: "retail", label: "Retail", mult: 1 },
+  { id: "pro", label: "Pro", mult: 0.4 },
+  { id: "vip", label: "VIP / HFT", mult: 0.1 },
+  { id: "maker", label: "Maker 0%", mult: 0 },
 ] as const;
 
 function initWallets(): Record<string, Wallet> {
@@ -31,6 +34,17 @@ const fmtUsd = (n: number) =>
   n.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
 const fmtNum = (n: number, d = 4) => n.toLocaleString("en-US", { maximumFractionDigits: d });
 
+// Mezcla el top-of-book de WS (más fresco) sobre la profundidad del REST,
+// con guardia de monotonicidad para no romper el order book.
+function overlayWs(book: OrderBook, top?: { bid: number; ask: number; ts: number }): OrderBook {
+  if (!book.ok || !top || top.ts <= book.ts || !book.bids.length || !book.asks.length) return book;
+  const bids = [...book.bids];
+  const asks = [...book.asks];
+  if (!bids[1] || top.bid >= bids[1].price) bids[0] = { price: top.bid, qty: bids[0].qty };
+  if (!asks[1] || top.ask <= asks[1].price) asks[0] = { price: top.ask, qty: asks[0].qty };
+  return { ...book, bids, asks, ts: top.ts, latencyMs: 0 };
+}
+
 export function ArbDashboard() {
   const [books, setBooks] = useState<OrderBook[]>([]);
   const [opps, setOpps] = useState<Opportunity[]>([]);
@@ -41,22 +55,34 @@ export function ArbDashboard() {
   const [running, setRunning] = useState(true);
   const [feeTier, setFeeTier] = useState<(typeof FEE_TIERS)[number]["id"]>("vip");
   const [serverLatency, setServerLatency] = useState(0);
-  const [lastTick, setLastTick] = useState(0);
   const [tickCount, setTickCount] = useState(0);
+  const [feedStatus, setFeedStatus] = useState<Record<string, FeedStatus>>({});
+  const [risk, setRisk] = useState<RiskState>({ tripped: false, reasons: [], maxBookAgeMs: 0 });
+  const [tri, setTri] = useState<{ results: TriResult[]; ts: number } | null>(null);
 
-  // refs para evitar stale closures dentro del intervalo
   const walletsRef = useRef(wallets);
   const pnlRef = useRef(pnl);
+  const peakPnlRef = useRef(0);
   const runningRef = useRef(running);
   const feeRef = useRef(feeTier);
+  const feedRef = useRef<LiveFeed | null>(null);
   walletsRef.current = wallets;
   pnlRef.current = pnl;
   runningRef.current = running;
   feeRef.current = feeTier;
 
-  const feeMult = FEE_TIERS.find((t) => t.id === feeRef.current)?.mult ?? 1;
+  // Arranca el feed WebSocket una vez.
+  useEffect(() => {
+    const feed = new LiveFeed();
+    feed.start();
+    feedRef.current = feed;
+    return () => feed.close();
+  }, []);
 
   const tick = useCallback(async () => {
+    const mult = FEE_TIERS.find((t) => t.id === feeRef.current)?.mult ?? 1;
+
+    // 1) REST: profundidad. 2) overlay top-of-book de WS (fresco).
     let payload: { books: OrderBook[]; serverLatencyMs: number };
     try {
       const res = await fetch("/api/orderbooks", { cache: "no-store" });
@@ -64,39 +90,49 @@ export function ArbDashboard() {
     } catch {
       return;
     }
-    const mult = FEE_TIERS.find((t) => t.id === feeRef.current)?.mult ?? 1;
-    const bookList = payload.books;
+    const tops = feedRef.current?.getTops() ?? {};
     const map: OrderBooks = {};
-    for (const b of bookList) map[b.exchange] = b;
-
-    setBooks(bookList);
+    const merged: OrderBook[] = [];
+    for (const b of payload.books) {
+      const m = overlayWs(b, tops[b.exchange]);
+      map[b.exchange] = m;
+      merged.push(m);
+    }
+    setBooks(merged);
     setServerLatency(payload.serverLatencyMs);
-    setLastTick(Date.now());
+    setFeedStatus(feedRef.current?.getStatus() ?? {});
     setTickCount((c) => c + 1);
 
-    const detected = detectOpportunities(map, mult);
+    const detectedRaw = detectOpportunities(map, mult);
+    const detected = sanitizeOpportunities(detectedRaw);
     setOpps(detected);
 
-    if (!runningRef.current) return;
+    // 3) Circuit breaker
+    const r = evaluateRisk(merged, detectedRaw, pnlRef.current, peakPnlRef.current, Date.now());
+    setRisk(r);
 
-    // Ejecutar oportunidades viables (gestión secuencial de wallets).
-    let w = walletsRef.current;
-    const newTrades: Trade[] = [];
-    let gained = 0;
-    for (const opp of detected.filter((o) => o.viable)) {
-      const { trade, wallets: nextW } = simulateExecution(opp, map, w, mult);
-      if (trade) {
-        w = nextW;
-        newTrades.push(trade);
-        gained += trade.netProfit;
+    // 4) Ejecución (solo si corre y el breaker no está disparado)
+    if (runningRef.current && !r.tripped) {
+      let w = walletsRef.current;
+      const newTrades: Trade[] = [];
+      let gained = 0;
+      for (const opp of detected.filter((o) => o.viable)) {
+        const { trade, wallets: nextW } = simulateExecution(opp, map, w, mult);
+        if (trade) {
+          w = nextW;
+          newTrades.push(trade);
+          gained += trade.netProfit;
+        }
+      }
+      if (newTrades.length) {
+        setWallets(w);
+        setTrades((prev) => [...newTrades.reverse(), ...prev].slice(0, 60));
+        const newPnl = pnlRef.current + gained;
+        setPnl(newPnl);
+        peakPnlRef.current = Math.max(peakPnlRef.current, newPnl);
       }
     }
-    if (newTrades.length) {
-      setWallets(w);
-      setTrades((prev) => [...newTrades.reverse(), ...prev].slice(0, 60));
-      setPnl((p) => p + gained);
-    }
-    setEquity((prev) => [...prev, { t: Date.now(), pnl: pnlRef.current + gained }].slice(-150));
+    setEquity((prev) => [...prev, { t: Date.now(), pnl: pnlRef.current }].slice(-150));
   }, []);
 
   useEffect(() => {
@@ -105,10 +141,34 @@ export function ArbDashboard() {
     return () => clearInterval(id);
   }, [tick]);
 
+  // Poll del triangular (Coinbase, 3 pares).
+  useEffect(() => {
+    let alive = true;
+    const run = async () => {
+      try {
+        const res = await fetch("/api/triangular", { cache: "no-store" });
+        const d = await res.json();
+        if (!alive || !d.ok) return;
+        const mult = FEE_TIERS.find((t) => t.id === feeRef.current)?.mult ?? 1;
+        const fee = (TAKER_FEE.coinbase ?? 0.006) * mult;
+        setTri({ results: detectTriangular(d.books as TriBooks, fee), ts: d.ts });
+      } catch {
+        /* noop */
+      }
+    };
+    run();
+    const id = setInterval(run, 2500);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, []);
+
   const reset = () => {
     setWallets(initWallets());
     setTrades([]);
     setPnl(0);
+    peakPnlRef.current = 0;
     setEquity([]);
     setTickCount(0);
   };
@@ -118,6 +178,7 @@ export function ArbDashboard() {
   const totalUsd = Object.values(wallets).reduce((s, w) => s + w.usd, 0);
   const totalBtc = Object.values(wallets).reduce((s, w) => s + w.btc, 0);
   const partialCount = trades.filter((t) => t.partial).length;
+  const wsLive = Object.values(feedStatus).filter((s) => s === "live").length;
 
   return (
     <main className="min-h-screen bg-neutral-950 text-neutral-100 px-4 md:px-6 py-8">
@@ -128,8 +189,8 @@ export function ArbDashboard() {
               Atalaya <span className="text-indigo-400">· Arbitraje BTC</span>
             </h1>
             <p className="text-neutral-400 text-sm mt-1">
-              Detección en tiempo real de divergencias de precio entre exchanges, con ejecución simulada
-              neta de fees y slippage.
+              Detección en tiempo real (WebSocket) de divergencias entre exchanges, ejecución simulada neta
+              de fees, slippage, latencia y retiros.
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -141,25 +202,25 @@ export function ArbDashboard() {
             >
               {running ? "⏸ Pausar" : "▶ Reanudar"}
             </button>
-            <button
-              onClick={reset}
-              className="px-3 py-1.5 rounded-lg text-sm font-medium bg-neutral-800 hover:bg-neutral-700"
-            >
+            <button onClick={reset} className="px-3 py-1.5 rounded-lg text-sm font-medium bg-neutral-800 hover:bg-neutral-700">
               ↺ Reset
             </button>
           </div>
         </header>
+
+        {/* Circuit breaker */}
+        {risk.tripped && (
+          <div className="mb-5 rounded-lg border border-rose-700 bg-rose-950/40 p-3 text-sm text-rose-200">
+            <strong>🛑 Circuit breaker activo</strong> — ejecución detenida: {risk.reasons.join(" · ")}
+          </div>
+        )}
 
         {/* KPIs */}
         <section className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
           <Kpi label="P&L realizado" value={fmtUsd(pnl)} accent={pnl >= 0} big />
           <Kpi label="Operaciones" value={`${trades.length}`} sub={`${partialCount} parciales`} />
           <Kpi label="Oportunidades viables" value={`${viableCount}`} sub={`de ${opps.length} detectadas`} />
-          <Kpi
-            label="Latencia (server)"
-            value={`${serverLatency} ms`}
-            sub={lastTick ? `tick #${tickCount}` : "…"}
-          />
+          <Kpi label="Feeds" value={`${wsLive} WS · ${okBooks.length}/${books.length} REST`} sub={`${serverLatency}ms · tick #${tickCount}`} />
         </section>
 
         {/* Control de fees */}
@@ -169,7 +230,6 @@ export function ArbDashboard() {
             <button
               key={t.id}
               onClick={() => setFeeTier(t.id)}
-              title={t.note}
               className={`px-2.5 py-1 rounded-full border ${
                 feeTier === t.id
                   ? "border-indigo-400 bg-indigo-500/20 text-indigo-200"
@@ -180,24 +240,32 @@ export function ArbDashboard() {
             </button>
           ))}
           <span className="text-neutral-500 text-xs ml-1">
-            Con fees retail, el arbitraje BTC/USD rara vez es neto-positivo (mercados eficientes). Los tiers
-            bajos reflejan por qué el arbitraje es un juego de HFT.
+            Con fees retail el arbitraje BTC/USD rara vez es neto-positivo (mercados eficientes); a fees HFT aparecen ejecuciones.
           </span>
         </section>
 
         <div className="grid lg:grid-cols-2 gap-6">
           {/* Order books */}
           <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5">
-            <h2 className="text-lg font-semibold mb-3">Mercado en vivo ({okBooks.length}/{books.length} exchanges)</h2>
+            <h2 className="text-lg font-semibold mb-3">Mercado en vivo</h2>
             <div className="space-y-2">
               {books.map((b) => (
                 <div key={b.exchange} className="flex items-center justify-between text-sm py-1.5 border-b border-neutral-800/50">
-                  <span className="font-medium w-24">{EXCHANGE_LABEL[b.exchange] ?? b.exchange}</span>
+                  <span className="font-medium w-24 flex items-center gap-1.5">
+                    {EXCHANGE_LABEL[b.exchange] ?? b.exchange}
+                    {feedStatus[b.exchange] === "live" ? (
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" title="WebSocket en vivo" />
+                    ) : (
+                      <span className="w-1.5 h-1.5 rounded-full bg-neutral-600" title="REST" />
+                    )}
+                  </span>
                   {b.ok ? (
                     <>
                       <span className="text-emerald-400 font-mono">bid {fmtUsd(b.bids[0]?.price ?? 0)}</span>
                       <span className="text-rose-400 font-mono">ask {fmtUsd(b.asks[0]?.price ?? 0)}</span>
-                      <span className="text-neutral-500 text-xs w-16 text-right">{b.latencyMs}ms</span>
+                      <span className="text-neutral-500 text-xs w-20 text-right">
+                        {feedStatus[b.exchange] === "live" ? "WS" : `${b.latencyMs}ms`}
+                      </span>
                     </>
                   ) : (
                     <span className="text-amber-500 text-xs">offline: {b.error}</span>
@@ -221,11 +289,7 @@ export function ArbDashboard() {
                   </defs>
                   <XAxis dataKey="t" hide />
                   <YAxis tick={{ fontSize: 11 }} stroke="#888" tickFormatter={(v) => `$${v.toFixed(0)}`} width={56} />
-                  <Tooltip
-                    formatter={(v) => [fmtUsd(Number(v)), "P&L"]}
-                    labelFormatter={() => ""}
-                    contentStyle={{ background: "#1e1e2e", border: "none", borderRadius: 8, fontSize: 12 }}
-                  />
+                  <Tooltip formatter={(v) => [fmtUsd(Number(v)), "P&L"]} labelFormatter={() => ""} contentStyle={{ background: "#1e1e2e", border: "none", borderRadius: 8, fontSize: 12 }} />
                   <Area type="monotone" dataKey="pnl" stroke="#34d399" strokeWidth={2} fill="url(#pnl)" />
                 </AreaChart>
               </ResponsiveContainer>
@@ -235,53 +299,59 @@ export function ArbDashboard() {
           </section>
         </div>
 
-        {/* Oportunidades */}
+        {/* Oportunidades cross-exchange */}
         <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5 mt-6">
-          <h2 className="text-lg font-semibold mb-3">Oportunidades detectadas</h2>
+          <h2 className="text-lg font-semibold mb-3">Oportunidades cross-exchange</h2>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead className="text-neutral-400 border-b border-neutral-800">
                 <tr>
                   <th className="text-left py-2">Comprar → Vender</th>
-                  <th className="text-right">Spread bruto</th>
-                  <th className="text-right">Vol. (BTC)</th>
-                  <th className="text-right">Neto/BTC</th>
-                  <th className="text-right">Neto total</th>
+                  <th className="text-right">Bruto</th>
+                  <th className="text-right">Vol.</th>
+                  <th className="text-right">Fees</th>
+                  <th className="text-right">Latencia</th>
+                  <th className="text-right">Neto</th>
                   <th className="text-right">Estado</th>
                 </tr>
               </thead>
               <tbody>
                 {opps.slice(0, 8).map((o) => (
                   <tr key={`${o.buyEx}-${o.sellEx}`} className="border-b border-neutral-800/40">
-                    <td className="py-2">
-                      {EXCHANGE_LABEL[o.buyEx]} → {EXCHANGE_LABEL[o.sellEx]}
-                    </td>
+                    <td className="py-2">{EXCHANGE_LABEL[o.buyEx]} → {EXCHANGE_LABEL[o.sellEx]}</td>
                     <td className="text-right font-mono">{o.grossBps.toFixed(1)} bps</td>
                     <td className="text-right font-mono">{o.maxQty > 0 ? fmtNum(o.maxQty, 3) : "—"}</td>
-                    <td className={`text-right font-mono ${o.netPerBtc > 0 ? "text-emerald-400" : "text-rose-400"}`}>
-                      {fmtUsd(o.netPerBtc)}
-                    </td>
-                    <td className={`text-right font-mono ${o.netProfit > 0 ? "text-emerald-400" : "text-neutral-500"}`}>
-                      {fmtUsd(o.netProfit)}
-                    </td>
+                    <td className="text-right font-mono text-neutral-500">{fmtUsd(o.feesCost)}</td>
+                    <td className="text-right font-mono text-neutral-500">{fmtUsd(o.latencyCost)}</td>
+                    <td className={`text-right font-mono ${o.netProfit > 0 ? "text-emerald-400" : "text-neutral-500"}`}>{fmtUsd(o.netProfit)}</td>
                     <td className="text-right">
-                      {o.viable ? (
-                        <span className="text-emerald-400 text-xs">✓ viable</span>
-                      ) : (
-                        <span className="text-neutral-500 text-xs">fees &gt; spread</span>
-                      )}
+                      {o.viable ? <span className="text-emerald-400 text-xs">✓ viable</span> : <span className="text-neutral-500 text-xs">no neto</span>}
                     </td>
                   </tr>
                 ))}
                 {opps.length === 0 && (
-                  <tr>
-                    <td colSpan={6} className="text-center text-neutral-500 py-4">
-                      Sin divergencias brutas en este instante.
-                    </td>
-                  </tr>
+                  <tr><td colSpan={7} className="text-center text-neutral-500 py-4">Sin divergencias brutas en este instante.</td></tr>
                 )}
               </tbody>
             </table>
+          </div>
+        </section>
+
+        {/* Arbitraje triangular */}
+        <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5 mt-6">
+          <h2 className="text-lg font-semibold mb-1">Arbitraje triangular <span className="text-neutral-500 text-sm font-normal">· Coinbase (USD/BTC/ETH)</span></h2>
+          <p className="text-sm text-neutral-400 mb-3">Ciclos intra-exchange sin mover fondos entre plataformas.</p>
+          <div className="grid sm:grid-cols-2 gap-3">
+            {tri?.results.map((r) => (
+              <div key={r.direction} className="rounded-lg border border-neutral-800 bg-neutral-950/50 p-3">
+                <div className="font-mono text-xs text-neutral-300">{r.direction}</div>
+                <div className="flex items-center justify-between mt-1">
+                  <span className={`text-lg font-semibold ${r.viable ? "text-emerald-400" : "text-rose-400"}`}>{r.netBps.toFixed(1)} bps</span>
+                  <span className="text-xs text-neutral-500">{r.viable ? "✓ viable" : "no rentable"}</span>
+                </div>
+              </div>
+            ))}
+            {!tri && <p className="text-neutral-500 text-sm">Conectando…</p>}
           </div>
         </section>
 
@@ -306,9 +376,7 @@ export function ArbDashboard() {
 
           <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5">
             <h2 className="text-lg font-semibold mb-1">Balances de wallets</h2>
-            <p className="text-xs text-neutral-500 mb-3">
-              Total: {fmtUsd(totalUsd)} + {fmtNum(totalBtc, 3)} BTC
-            </p>
+            <p className="text-xs text-neutral-500 mb-3">Total: {fmtUsd(totalUsd)} + {fmtNum(totalBtc, 3)} BTC</p>
             <div className="space-y-2">
               {Object.values(wallets).map((w) => (
                 <div key={w.exchange} className="flex items-center justify-between text-sm py-1 border-b border-neutral-800/40">
@@ -322,33 +390,19 @@ export function ArbDashboard() {
         </div>
 
         <p className="text-xs text-neutral-600 mt-6">
-          Simulación educativa / demo. Ejecución simulada (no se opera capital real). Fees taker aproximados
-          y públicos por exchange; slippage modelado recorriendo el order book real.
+          Simulación educativa / demo (no opera capital real). Net = bruto − fees taker − slippage (order book real)
+          − adverse selection por latencia − retiro amortizado. Feeds: WebSocket (Coinbase/Kraken/Bitstamp) + REST.
         </p>
       </div>
     </main>
   );
 }
 
-function Kpi({
-  label,
-  value,
-  sub,
-  accent,
-  big,
-}: {
-  label: string;
-  value: string;
-  sub?: string;
-  accent?: boolean;
-  big?: boolean;
-}) {
+function Kpi({ label, value, sub, accent, big }: { label: string; value: string; sub?: string; accent?: boolean; big?: boolean }) {
   return (
     <div className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-4">
       <p className="text-xs text-neutral-400 uppercase tracking-wide">{label}</p>
-      <p className={`font-semibold mt-1 ${big ? "text-2xl" : "text-xl"} ${accent === undefined ? "" : accent ? "text-emerald-400" : "text-rose-400"}`}>
-        {value}
-      </p>
+      <p className={`font-semibold mt-1 ${big ? "text-2xl" : "text-lg"} ${accent === undefined ? "" : accent ? "text-emerald-400" : "text-rose-400"}`}>{value}</p>
       {sub && <p className="text-xs text-neutral-500 mt-0.5">{sub}</p>}
     </div>
   );

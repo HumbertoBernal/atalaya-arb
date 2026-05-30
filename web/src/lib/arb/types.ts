@@ -23,8 +23,11 @@ export type Opportunity = {
   grossSpread: number; // sellBid - buyAsk (por BTC, bruto)
   grossBps: number; // spread bruto en puntos básicos sobre buyAsk
   maxQty: number; // BTC ejecutables limitados por liquidez visible
-  netPerBtc: number; // ganancia neta por BTC al tope de liquidez (con fees+slippage)
-  netProfit: number; // ganancia neta total estimada para maxQty
+  feesCost: number; // USD en comisiones (taker, ambos exchanges)
+  latencyCost: number; // USD de adverse selection por latencia de red
+  withdrawalCost: number; // USD de retiro amortizado (rebalanceo)
+  netPerBtc: number; // ganancia neta por BTC (todo incluido)
+  netProfit: number; // ganancia neta total (fees + slippage + latencia + retiro)
   netBps: number; // margen neto en bps
   viable: boolean; // netProfit > 0
 };

@@ -1,9 +1,40 @@
 // Motor de arbitraje: detección, cálculo de rentabilidad neta y simulación.
 // Funciones puras → testeables y deterministas.
-import { MAX_TRADE_BTC, TAKER_FEE } from "./config";
+import {
+  BTC_VOL_PER_SEC,
+  MAX_TRADE_BTC,
+  NETWORK_LATENCY_MS,
+  REBALANCE_EVERY,
+  TAKER_FEE,
+  WITHDRAWAL_FEE_BTC,
+} from "./config";
 import type { Level, OrderBook, OrderBooks, Opportunity, Trade, Wallet } from "./types";
 
 const EPS = 1e-9;
+
+/**
+ * Fricciones más allá de fees/slippage (exigidas por el enunciado):
+ * - Latencia de red → adverse selection: el precio puede moverse en contra
+ *   durante la ventana de ejecución. Modelado como un movimiento de 1σ sobre
+ *   la latencia combinada de ambos exchanges.
+ * - Withdrawal fee amortizado: el arbitraje pre-posicionado rebalancea cada
+ *   N operaciones; el costo on-chain se reparte entre ellas.
+ */
+export function frictionCosts(
+  buyEx: string,
+  sellEx: string,
+  qty: number,
+  avgPrice: number,
+): { latencyCost: number; withdrawalCost: number } {
+  const latencySec = ((NETWORK_LATENCY_MS[buyEx] ?? 150) + (NETWORK_LATENCY_MS[sellEx] ?? 150)) / 1000;
+  const adversePerBtc = avgPrice * BTC_VOL_PER_SEC * Math.sqrt(latencySec); // 1σ
+  const latencyCost = adversePerBtc * qty;
+
+  const withdrawalBtc = (WITHDRAWAL_FEE_BTC[buyEx] ?? 0) + (WITHDRAWAL_FEE_BTC[sellEx] ?? 0);
+  const withdrawalCost = (withdrawalBtc / REBALANCE_EVERY) * avgPrice;
+
+  return { latencyCost, withdrawalCost };
+}
 
 /**
  * Tamaño óptimo de arbitraje por profitabilidad MARGINAL.
@@ -88,7 +119,9 @@ export function detectOpportunities(books: OrderBooks, feeMult = 1): Opportunity
       );
 
       const feesUsd = buyCost * buyFee + sellProceeds * sellFee;
-      const netProfit = sellProceeds - buyCost - feesUsd;
+      const avgPrice = qty > 0 ? buyCost / qty : buyAsk;
+      const { latencyCost, withdrawalCost } = frictionCosts(buyEx, sellEx, qty, avgPrice);
+      const netProfit = sellProceeds - buyCost - feesUsd - latencyCost - withdrawalCost;
       const netPerBtc = qty > 0 ? netProfit / qty : 0;
 
       opps.push({
@@ -99,6 +132,9 @@ export function detectOpportunities(books: OrderBooks, feeMult = 1): Opportunity
         grossSpread,
         grossBps: (grossSpread / buyAsk) * 10_000,
         maxQty: qty,
+        feesCost: feesUsd,
+        latencyCost,
+        withdrawalCost,
         netPerBtc,
         netProfit,
         netBps: buyCost > 0 ? (netProfit / buyCost) * 10_000 : 0,
@@ -145,7 +181,8 @@ export function simulateExecution(
   const buyFeeUsd = buyCost * buyFee;
   const sellFeeUsd = sellProceeds * sellFee;
   const grossProfit = sellProceeds - buyCost;
-  const netProfit = grossProfit - buyFeeUsd - sellFeeUsd;
+  const { latencyCost, withdrawalCost } = frictionCosts(opp.buyEx, opp.sellEx, exec.qty, exec.avgBuy);
+  const netProfit = grossProfit - buyFeeUsd - sellFeeUsd - latencyCost - withdrawalCost;
 
   if (netProfit <= 0) return { trade: null, wallets };
 
@@ -158,7 +195,8 @@ export function simulateExecution(
   };
   next[opp.sellEx] = {
     ...sellW,
-    usd: sellW.usd + sellProceeds - sellFeeUsd,
+    // proceeds netos de fee y de la fricción modelada (latencia + retiro amortizado)
+    usd: sellW.usd + sellProceeds - sellFeeUsd - latencyCost - withdrawalCost,
     btc: sellW.btc - exec.qty,
   };
 
