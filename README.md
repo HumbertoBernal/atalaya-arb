@@ -38,8 +38,11 @@ Cliente (React, ~1.2s + push WS)
 ### Capacidades
 
 - **5 venues USD principales**: Coinbase, Kraken, Bitstamp, Gemini, Bitfinex.
-- **Feeds WebSocket** (Coinbase, Kraken, Bitstamp, Bitfinex) para best bid/ask sub-segundo, con
-  reconexión y fallback a REST; Gemini por REST. La profundidad para sizing viene del REST.
+- **Order book L2 completo por WebSocket** (Bitstamp, Kraken, Bitfinex, Gemini): se mantiene el libro
+  entero en tiempo real (snapshot + deltas), con reconexión, guarda de libro-cruzado y **fallback a REST**
+  si un feed cae. Coinbase por REST + ticker WS (su L2 exige auth). Sizing/slippage usan la profundidad L2.
+- **Modo Maker / Taker**: ejecución inmediata (taker) o por órdenes límite (maker, fees menores, viable
+  en retail) con haircut por probabilidad de fill (riesgo de ejecución).
 - **Panel de métricas**: latencia de detección p50/p99, throughput WS (msgs/seg), frescura de datos
   y latencia de fetch del server — el criterio #1 (velocidad) medido, no afirmado.
 - **Cálculo neto completo**: fees taker por exchange + slippage (order book real) + **adverse selection
@@ -85,7 +88,8 @@ web/src/
     SpreadMatrix.tsx  # heatmap exchange × exchange
   lib/arb/
     exchanges.ts   # conectores REST + normalización
-    livefeed.ts    # feeds WebSocket (cliente) + reconexión/fallback
+    livefeed.ts    # feeds WebSocket top-of-book (cliente) + reconexión
+    l2book.ts      # order book L2 completo por WebSocket (snapshot + deltas)
     engine.ts      # detección, optimalArb, fricción, simulación (puro, testeable)
     risk.ts        # circuit breaker
     triangular.ts  # arbitraje triangular intra-exchange
@@ -119,9 +123,9 @@ pnpm test           # tests unitarios del motor (13 casos)
 
 ## Limitaciones honestas
 
-- WebSocket para best bid/ask (Coinbase/Kraken/Bitstamp); la **profundidad** se refresca por REST
-  (~1.2s). El HFT real opera en microsegundos y mantiene el libro completo por WS.
-- Gemini permanece en REST (su feed L2 requiere reconstruir el libro; se priorizó robustez de la demo).
+- Libro L2 completo por WS en 4 venues; **Coinbase** queda en REST + ticker WS (su canal level2 exige
+  autenticación). El bucle de detección corre a ~1.2s; el HFT real opera en microsegundos.
 - Pares BTC/USD (y BTC/ETH/USD para el triangular). El arbitraje "real" requiere inventario
-  pre-posicionado, que es justo lo que simulamos.
-- Fees, withdrawal y latencia son aproximados y públicos por exchange; no incluye descuentos personalizados.
+  pre-posicionado entre venues — que es justo lo que simulamos, con rebalanceo automático.
+- Fees, withdrawal, latencia y probabilidad de fill son aproximados y públicos por exchange; no incluye
+  descuentos personalizados.

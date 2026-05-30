@@ -12,6 +12,7 @@ import {
 import { EXCHANGE_LABEL, EXCHANGES, INITIAL_BTC, INITIAL_USD, MAKER_FEE, TAKER_FEE } from "@/lib/arb/config";
 import { detectOpportunities, simulateExecution } from "@/lib/arb/engine";
 import { LiveFeed, type FeedStatus } from "@/lib/arb/livefeed";
+import { L2Feed } from "@/lib/arb/l2book";
 import { evaluateRisk, sanitizeOpportunities, type RiskState } from "@/lib/arb/risk";
 import { needsRebalance, rebalance } from "@/lib/arb/rebalance";
 import { pushCapped, zScore, type ZScore } from "@/lib/arb/stats";
@@ -92,20 +93,27 @@ export function ArbDashboard() {
   const feeRef = useRef(feeTier);
   const makerRef = useRef(makerMode);
   const feedRef = useRef<LiveFeed | null>(null);
+  const l2Ref = useRef<L2Feed | null>(null);
   walletsRef.current = wallets;
   pnlRef.current = pnl;
   runningRef.current = running;
   feeRef.current = feeTier;
   makerRef.current = makerMode;
 
-  // Arranca el feed WebSocket una vez.
+  // Arranca los feeds WebSocket una vez: top-of-book (LiveFeed) + L2 completo (L2Feed).
   useEffect(() => {
     const feed = new LiveFeed();
     feed.start();
     feedRef.current = feed;
+    const l2 = new L2Feed();
+    l2.start();
+    l2Ref.current = l2;
     sessionRef.current.startTs = Date.now();
     setSession({ ...sessionRef.current });
-    return () => feed.close();
+    return () => {
+      feed.close();
+      l2.close();
+    };
   }, []);
 
   const tick = useCallback(async () => {
@@ -120,16 +128,26 @@ export function ArbDashboard() {
       return;
     }
     const tops = feedRef.current?.getTops() ?? {};
+    const l2books = l2Ref.current?.getBooks() ?? {};
+    const now = Date.now();
     const map: OrderBooks = {};
     const merged: OrderBook[] = [];
     for (const b of payload.books) {
-      const m = overlayWs(b, tops[b.exchange]);
+      const l2 = l2books[b.exchange];
+      // Preferir el libro L2 por WebSocket (profundidad en tiempo real) si está
+      // fresco Y es válido (no cruzado); si no, caer al REST con overlay.
+      const l2Valid =
+        l2 && l2.bids.length && l2.asks.length && now - l2.ts < 5000 && l2.bids[0].price < l2.asks[0].price;
+      const m = l2Valid ? { ...l2, latencyMs: 0 } : overlayWs(b, tops[b.exchange]);
       map[b.exchange] = m;
       merged.push(m);
     }
     setBooks(merged);
     setServerLatency(payload.serverLatencyMs);
-    setFeedStatus(feedRef.current?.getStatus() ?? {});
+    // Estado de feed combinado: L2 (4 venues) + top-of-book (coinbase).
+    const l2Status = l2Ref.current?.getStatus() ?? {};
+    const topStatus = feedRef.current?.getStatus() ?? {};
+    setFeedStatus({ ...topStatus, ...l2Status });
     setTickCount((c) => c + 1);
 
     const maker = makerRef.current;
@@ -144,7 +162,10 @@ export function ArbDashboard() {
     buf.push(detMs);
     if (buf.length > 100) buf.shift();
     const rates = feedRef.current?.getRates() ?? {};
-    const wsRate = Object.values(rates).reduce((a, b) => a + b, 0);
+    const l2Rates = l2Ref.current?.getRates() ?? {};
+    const wsRate =
+      Object.values(rates).reduce((a, b) => a + b, 0) +
+      Object.values(l2Rates).reduce((a, b) => a + b, 0);
     const liveAges = merged.filter((b) => b.ok).map((b) => Date.now() - b.ts);
     setMetrics({
       detP50: pctile(buf, 50),
