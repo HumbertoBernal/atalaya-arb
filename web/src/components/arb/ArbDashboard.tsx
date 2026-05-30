@@ -13,6 +13,7 @@ import { EXCHANGE_LABEL, EXCHANGES, INITIAL_BTC, INITIAL_USD, TAKER_FEE } from "
 import { detectOpportunities, simulateExecution } from "@/lib/arb/engine";
 import { LiveFeed, type FeedStatus } from "@/lib/arb/livefeed";
 import { evaluateRisk, sanitizeOpportunities, type RiskState } from "@/lib/arb/risk";
+import { needsRebalance, rebalance } from "@/lib/arb/rebalance";
 import { pushCapped, zScore, type ZScore } from "@/lib/arb/stats";
 import { detectTriangular, type TriBooks, type TriResult } from "@/lib/arb/triangular";
 import type { OrderBook, OrderBooks, Opportunity, Trade, Wallet } from "@/lib/arb/types";
@@ -80,8 +81,8 @@ export function ArbDashboard() {
   const detTimesRef = useRef<number[]>([]);
   const [stat, setStat] = useState<ZScore & { current: number }>({ mean: 0, std: 0, z: 0, n: 0, current: 0 });
   const spreadHistRef = useRef<number[]>([]);
-  const [session, setSession] = useState({ oppsSeen: 0, viableSeen: 0, volumeBtc: 0, bestTrade: 0, startTs: 0 });
-  const sessionRef = useRef({ oppsSeen: 0, viableSeen: 0, volumeBtc: 0, bestTrade: 0, startTs: 0 });
+  const [session, setSession] = useState({ oppsSeen: 0, viableSeen: 0, volumeBtc: 0, bestTrade: 0, rebalances: 0, startTs: 0 });
+  const sessionRef = useRef({ oppsSeen: 0, viableSeen: 0, volumeBtc: 0, bestTrade: 0, rebalances: 0, startTs: 0 });
 
   const walletsRef = useRef(wallets);
   const pnlRef = useRef(pnl);
@@ -175,15 +176,29 @@ export function ArbDashboard() {
           gained += trade.netProfit;
         }
       }
-      if (newTrades.length) {
+
+      // Rebalanceo de inventario si algún venue se agotó (paga fees de red).
+      let rebalanceCost = 0;
+      const okB = merged.find((b) => b.ok && b.bids.length && b.asks.length);
+      const refP = okB ? (okB.bids[0].price + okB.asks[0].price) / 2 : 0;
+      if (refP && needsRebalance(w)) {
+        const rb = rebalance(w, refP);
+        w = rb.wallets;
+        rebalanceCost = rb.costUsd;
+        s.rebalances += 1;
+      }
+
+      if (newTrades.length || rebalanceCost > 0) {
         setWallets(w);
-        setTrades((prev) => [...newTrades.reverse(), ...prev].slice(0, 60));
-        const newPnl = pnlRef.current + gained;
+        const newPnl = pnlRef.current + gained - rebalanceCost;
         setPnl(newPnl);
         peakPnlRef.current = Math.max(peakPnlRef.current, newPnl);
-        for (const tr of newTrades) {
-          s.volumeBtc += tr.qty;
-          s.bestTrade = Math.max(s.bestTrade, tr.netProfit);
+        if (newTrades.length) {
+          setTrades((prev) => [...newTrades.reverse(), ...prev].slice(0, 60));
+          for (const tr of newTrades) {
+            s.volumeBtc += tr.qty;
+            s.bestTrade = Math.max(s.bestTrade, tr.netProfit);
+          }
         }
       }
     }
@@ -227,7 +242,7 @@ export function ArbDashboard() {
     peakPnlRef.current = 0;
     setEquity([]);
     setTickCount(0);
-    sessionRef.current = { oppsSeen: 0, viableSeen: 0, volumeBtc: 0, bestTrade: 0, startTs: Date.now() };
+    sessionRef.current = { oppsSeen: 0, viableSeen: 0, volumeBtc: 0, bestTrade: 0, rebalances: 0, startTs: Date.now() };
     setSession({ ...sessionRef.current });
     spreadHistRef.current = [];
   };
@@ -433,6 +448,7 @@ export function ArbDashboard() {
               <Stat label="Capture rate" value={session.viableSeen ? `${((trades.length / session.viableSeen) * 100).toFixed(0)}%` : "—"} />
               <Stat label="Volumen operado" value={`${fmtNum(session.volumeBtc, 3)} BTC`} />
               <Stat label="Mejor operación" value={fmtUsd(session.bestTrade)} />
+              <Stat label="Rebalanceos" value={`${session.rebalances}`} />
             </div>
           </section>
         </div>

@@ -39,6 +39,15 @@ export const WITHDRAWAL_FEE_BTC: Record<string, number> = {
 // Cada cuántas operaciones se amortiza un retiro (rebalanceo).
 export const REBALANCE_EVERY = 25;
 
+// --- Rebalanceo automático de inventario ---
+// Cuando un exchange se queda sin USD o sin BTC, esa ruta de arbitraje muere.
+// Las mesas reales rebalancean inventario entre venues (pagando fees de red).
+export const REBALANCE = {
+  minUsd: 5_000,        // si el USD de un venue baja de esto → rebalancear
+  minBtc: 0.1,          // si el BTC de un venue baja de esto → rebalancear
+  btcNetworkFee: 0.0003, // fee de red por transferencia BTC entre venues
+};
+
 // --- Latencia de red estimada por exchange (ms) para adverse selection ---
 export const NETWORK_LATENCY_MS: Record<string, number> = {
   coinbase: 120,

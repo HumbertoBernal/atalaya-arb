@@ -17,8 +17,8 @@ en bruto puede ser negativa tras **fees, slippage y liquidez** — y ahí está 
 ## Cómo funciona
 
 ```
-Exchanges (Coinbase, Kraken, Bitstamp, Gemini)
-   │  WebSocket (CB/KR/BS, top-of-book en vivo)     │  REST (profundidad)
+Exchanges (Coinbase, Kraken, Bitstamp, Gemini, Bitfinex)
+   │  WebSocket (CB/KR/BS/BF, top-of-book en vivo)  │  REST (profundidad)
    ▼                                                ▼
 LiveFeed (cliente)                          /api/orderbooks · /api/triangular
    │  mejor bid/ask sub-segundo                     │  server-side (evita CORS/geo)
@@ -70,28 +70,34 @@ Cliente (React, ~1.2s + push WS)
 
 ## Exchanges y fees
 
-Order books públicos de **Coinbase, Kraken, Bitstamp y Gemini** (BTC/USD, sin API key). Fees taker
-aproximados y públicos por exchange (en `src/lib/arb/config.ts`), documentados como supuestos.
+Order books públicos de **Coinbase, Kraken, Bitstamp, Gemini y Bitfinex** (BTC/USD, sin API key). Fees
+taker aproximados y públicos por exchange (en `src/lib/arb/config.ts`), documentados como supuestos.
 
 ## Estructura
 
 ```
 web/src/
   app/api/orderbooks/route.ts   # BFF: fetch paralelo de order books
-  app/page.tsx                  # render del dashboard
-  components/arb/ArbDashboard.tsx  # UI tiempo real (polling, KPIs, tablas, P&L)
   app/api/triangular/route.ts   # BFF: 3 pares de Coinbase para triangular
+  app/page.tsx                  # render del dashboard
+  components/arb/
+    ArbDashboard.tsx  # UI tiempo real (polling, KPIs, tablas, P&L, métricas)
+    SpreadMatrix.tsx  # heatmap exchange × exchange
   lib/arb/
     exchanges.ts   # conectores REST + normalización
     livefeed.ts    # feeds WebSocket (cliente) + reconexión/fallback
     engine.ts      # detección, optimalArb, fricción, simulación (puro, testeable)
     risk.ts        # circuit breaker
     triangular.ts  # arbitraje triangular intra-exchange
-    config.ts      # exchanges, fees, withdrawal, latencia, riesgo
+    rebalance.ts   # rebalanceo de inventario entre venues
+    stats.ts       # z-score (arbitraje estadístico)
+    config.ts      # exchanges, fees, withdrawal, latencia, riesgo, rebalanceo
     types.ts
 scripts/test-engine.ts          # tests unitarios (pnpm test)
 scripts/test-arb.ts             # test de humo con order books reales
 ```
+
+Ver **[DEMO.md](DEMO.md)** para el guion de demo de 90s orientado al jurado.
 
 ## Cómo correr
 
