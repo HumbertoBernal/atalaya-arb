@@ -37,8 +37,11 @@ Cliente (React, ~1.2s + push WS)
 
 ### Capacidades
 
-- **Feeds WebSocket** (Coinbase, Kraken, Bitstamp) para best bid/ask sub-segundo, con reconexión y
-  fallback a REST; Gemini por REST. La profundidad para sizing viene del REST.
+- **5 venues USD principales**: Coinbase, Kraken, Bitstamp, Gemini, Bitfinex.
+- **Feeds WebSocket** (Coinbase, Kraken, Bitstamp, Bitfinex) para best bid/ask sub-segundo, con
+  reconexión y fallback a REST; Gemini por REST. La profundidad para sizing viene del REST.
+- **Panel de métricas**: latencia de detección p50/p99, throughput WS (msgs/seg), frescura de datos
+  y latencia de fetch del server — el criterio #1 (velocidad) medido, no afirmado.
 - **Cálculo neto completo**: fees taker por exchange + slippage (order book real) + **adverse selection
   por latencia de red** + **withdrawal fee amortizado** (rebalanceo).
 - **Circuit breaker**: detiene la ejecución ante datos stale, spread anómalo (dato corrupto) o drawdown.

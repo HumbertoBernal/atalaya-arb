@@ -1,6 +1,6 @@
 // Configuración de exchanges: fees taker públicos aproximados (documentados como
 // supuestos en el README). Valores conservadores del tier minorista.
-export const EXCHANGES = ["coinbase", "kraken", "bitstamp", "gemini"] as const;
+export const EXCHANGES = ["coinbase", "kraken", "bitstamp", "gemini", "bitfinex"] as const;
 export type ExchangeId = (typeof EXCHANGES)[number];
 
 export const TAKER_FEE: Record<string, number> = {
@@ -8,6 +8,7 @@ export const TAKER_FEE: Record<string, number> = {
   kraken: 0.0026, // 0.26%
   bitstamp: 0.004, // 0.40%
   gemini: 0.004, // 0.40% (API/ActiveTrader)
+  bitfinex: 0.002, // 0.20% taker
 };
 
 export const EXCHANGE_LABEL: Record<string, string> = {
@@ -15,6 +16,7 @@ export const EXCHANGE_LABEL: Record<string, string> = {
   kraken: "Kraken",
   bitstamp: "Bitstamp",
   gemini: "Gemini",
+  bitfinex: "Bitfinex",
 };
 
 // Tope de notional por operación simulada (gestión de riesgo / circuit breaker simple).
@@ -32,6 +34,7 @@ export const WITHDRAWAL_FEE_BTC: Record<string, number> = {
   kraken: 0.00002,   // ~fee de red BTC
   bitstamp: 0.00005,
   gemini: 0.0,       // Gemini ofrece retiros gratuitos limitados
+  bitfinex: 0.0004,  // ~fee de red BTC de Bitfinex
 };
 // Cada cuántas operaciones se amortiza un retiro (rebalanceo).
 export const REBALANCE_EVERY = 25;
@@ -42,6 +45,7 @@ export const NETWORK_LATENCY_MS: Record<string, number> = {
   kraken: 150,
   bitstamp: 180,
   gemini: 140,
+  bitfinex: 160,
 };
 // Volatilidad intradía aprox. de BTC por segundo (fracción), para estimar
 // cuánto puede moverse el precio en contra durante la ventana de latencia.

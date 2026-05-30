@@ -82,7 +82,20 @@ export const fetchGemini = () =>
     };
   });
 
-const FETCHERS = [fetchCoinbase, fetchKraken, fetchBitstamp, fetchGemini];
+export const fetchBitfinex = () =>
+  wrap("bitfinex", async () => {
+    // [[price, count, amount], ...]; amount>0 = bid, amount<0 = ask.
+    const rows = (await fetchJson(`https://api-pub.bitfinex.com/v2/book/tBTCUSD/P0?len=${DEPTH}`)) as number[][];
+    const bids: Level[] = [];
+    const asks: Level[] = [];
+    for (const [price, , amount] of rows) {
+      if (amount > 0) bids.push({ price, qty: amount });
+      else if (amount < 0) asks.push({ price, qty: -amount });
+    }
+    return { bids, asks };
+  });
+
+const FETCHERS = [fetchCoinbase, fetchKraken, fetchBitstamp, fetchGemini, fetchBitfinex];
 
 /** Trae todos los order books en paralelo (latencia = la del más lento). */
 export async function fetchAllBooks(): Promise<OrderBook[]> {

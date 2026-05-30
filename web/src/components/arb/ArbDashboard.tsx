@@ -34,6 +34,13 @@ const fmtUsd = (n: number) =>
   n.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
 const fmtNum = (n: number, d = 4) => n.toLocaleString("en-US", { maximumFractionDigits: d });
 
+function pctile(arr: number[], p: number): number {
+  if (!arr.length) return 0;
+  const sorted = [...arr].sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
+  return sorted[idx];
+}
+
 // Mezcla el top-of-book de WS (más fresco) sobre la profundidad del REST,
 // con guardia de monotonicidad para no romper el order book.
 function overlayWs(book: OrderBook, top?: { bid: number; ask: number; ts: number }): OrderBook {
@@ -59,6 +66,8 @@ export function ArbDashboard() {
   const [feedStatus, setFeedStatus] = useState<Record<string, FeedStatus>>({});
   const [risk, setRisk] = useState<RiskState>({ tripped: false, reasons: [], maxBookAgeMs: 0 });
   const [tri, setTri] = useState<{ results: TriResult[]; ts: number } | null>(null);
+  const [metrics, setMetrics] = useState({ detP50: 0, detP99: 0, wsRate: 0, freshnessMs: 0 });
+  const detTimesRef = useRef<number[]>([]);
 
   const walletsRef = useRef(wallets);
   const pnlRef = useRef(pnl);
@@ -103,9 +112,25 @@ export function ArbDashboard() {
     setFeedStatus(feedRef.current?.getStatus() ?? {});
     setTickCount((c) => c + 1);
 
+    const t0 = performance.now();
     const detectedRaw = detectOpportunities(map, mult);
+    const detMs = performance.now() - t0;
     const detected = sanitizeOpportunities(detectedRaw);
     setOpps(detected);
+
+    // Métricas de latencia/throughput
+    const buf = detTimesRef.current;
+    buf.push(detMs);
+    if (buf.length > 100) buf.shift();
+    const rates = feedRef.current?.getRates() ?? {};
+    const wsRate = Object.values(rates).reduce((a, b) => a + b, 0);
+    const liveAges = merged.filter((b) => b.ok).map((b) => Date.now() - b.ts);
+    setMetrics({
+      detP50: pctile(buf, 50),
+      detP99: pctile(buf, 99),
+      wsRate,
+      freshnessMs: liveAges.length ? Math.min(...liveAges) : 0,
+    });
 
     // 3) Circuit breaker
     const r = evaluateRisk(merged, detectedRaw, pnlRef.current, peakPnlRef.current, Date.now());
@@ -242,6 +267,14 @@ export function ArbDashboard() {
           <span className="text-neutral-500 text-xs ml-1">
             Con fees retail el arbitraje BTC/USD rara vez es neto-positivo (mercados eficientes); a fees HFT aparecen ejecuciones.
           </span>
+        </section>
+
+        {/* Métricas de rendimiento */}
+        <section className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+          <Metric label="Detección p50" value={`${metrics.detP50.toFixed(2)} ms`} good={metrics.detP50 < 1} />
+          <Metric label="Detección p99" value={`${metrics.detP99.toFixed(2)} ms`} good={metrics.detP99 < 3} />
+          <Metric label="WS msgs/seg" value={`${metrics.wsRate}`} good={metrics.wsRate > 0} />
+          <Metric label="Frescura datos" value={`${metrics.freshnessMs} ms`} good={metrics.freshnessMs < 1500} />
         </section>
 
         <div className="grid lg:grid-cols-2 gap-6">
@@ -395,6 +428,18 @@ export function ArbDashboard() {
         </p>
       </div>
     </main>
+  );
+}
+
+function Metric({ label, value, good }: { label: string; value: string; good?: boolean }) {
+  return (
+    <div className="rounded-lg border border-neutral-800 bg-neutral-900/40 px-3 py-2">
+      <div className="flex items-center justify-between">
+        <span className="text-xs text-neutral-400">{label}</span>
+        <span className={`w-1.5 h-1.5 rounded-full ${good ? "bg-emerald-400" : "bg-neutral-600"}`} />
+      </div>
+      <p className="font-mono text-base mt-0.5">{value}</p>
+    </div>
   );
 }
 

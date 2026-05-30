@@ -51,6 +51,18 @@ const ADAPTERS: Adapter[] = [
       return null;
     },
   },
+  {
+    exchange: "bitfinex",
+    url: "wss://api-pub.bitfinex.com/ws/2",
+    subscribe: { event: "subscribe", channel: "ticker", symbol: "tBTCUSD" },
+    parse: (m) => {
+      // [CHAN_ID, [BID, BID_SIZE, ASK, ASK_SIZE, ...]]
+      if (!Array.isArray(m) || !Array.isArray(m[1]) || m[1].length < 4) return null;
+      const t = m[1] as number[];
+      if (t[0] > 0 && t[2] > 0) return { bid: t[0], ask: t[2] };
+      return null;
+    },
+  },
 ];
 
 export class LiveFeed {
@@ -58,6 +70,7 @@ export class LiveFeed {
   private tops = new Map<string, Top>();
   private status = new Map<string, FeedStatus>();
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
+  private msgTimes = new Map<string, number[]>(); // timestamps recientes por exchange
   private closed = false;
 
   start() {
@@ -79,6 +92,11 @@ export class LiveFeed {
 
     ws.onopen = () => ws.send(JSON.stringify(a.subscribe));
     ws.onmessage = (ev) => {
+      // Throughput: cada mensaje recibido cuenta como evento procesado.
+      const times = this.msgTimes.get(a.exchange) ?? [];
+      times.push(Date.now());
+      this.msgTimes.set(a.exchange, times);
+
       let parsed: { bid: number; ask: number } | null = null;
       try {
         parsed = a.parse(JSON.parse(ev.data as string));
@@ -113,6 +131,18 @@ export class LiveFeed {
 
   getStatus(): Record<string, FeedStatus> {
     return Object.fromEntries(this.status);
+  }
+
+  /** Mensajes WS por segundo, por exchange (ventana de 1s). */
+  getRates(): Record<string, number> {
+    const cutoff = Date.now() - 1000;
+    const out: Record<string, number> = {};
+    for (const [ex, times] of this.msgTimes) {
+      const recent = times.filter((t) => t > cutoff);
+      this.msgTimes.set(ex, recent); // trim
+      out[ex] = recent.length;
+    }
+    return out;
   }
 
   close() {
