@@ -9,12 +9,14 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { EXCHANGE_LABEL, INITIAL_BTC, INITIAL_USD, TAKER_FEE } from "@/lib/arb/config";
+import { EXCHANGE_LABEL, EXCHANGES, INITIAL_BTC, INITIAL_USD, TAKER_FEE } from "@/lib/arb/config";
 import { detectOpportunities, simulateExecution } from "@/lib/arb/engine";
 import { LiveFeed, type FeedStatus } from "@/lib/arb/livefeed";
 import { evaluateRisk, sanitizeOpportunities, type RiskState } from "@/lib/arb/risk";
+import { pushCapped, zScore, type ZScore } from "@/lib/arb/stats";
 import { detectTriangular, type TriBooks, type TriResult } from "@/lib/arb/triangular";
 import type { OrderBook, OrderBooks, Opportunity, Trade, Wallet } from "@/lib/arb/types";
+import { SpreadMatrix } from "./SpreadMatrix";
 
 const POLL_MS = 1200;
 const FEE_TIERS = [
@@ -39,6 +41,14 @@ function pctile(arr: number[], p: number): number {
   const sorted = [...arr].sort((a, b) => a - b);
   const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
   return sorted[idx];
+}
+
+function fmtDuration(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  const h = Math.floor(m / 60);
+  if (h > 0) return `${h}h ${m % 60}m`;
+  return `${m}m ${s % 60}s`;
 }
 
 // Mezcla el top-of-book de WS (más fresco) sobre la profundidad del REST,
@@ -68,6 +78,10 @@ export function ArbDashboard() {
   const [tri, setTri] = useState<{ results: TriResult[]; ts: number } | null>(null);
   const [metrics, setMetrics] = useState({ detP50: 0, detP99: 0, wsRate: 0, freshnessMs: 0 });
   const detTimesRef = useRef<number[]>([]);
+  const [stat, setStat] = useState<ZScore & { current: number }>({ mean: 0, std: 0, z: 0, n: 0, current: 0 });
+  const spreadHistRef = useRef<number[]>([]);
+  const [session, setSession] = useState({ oppsSeen: 0, viableSeen: 0, volumeBtc: 0, bestTrade: 0, startTs: 0 });
+  const sessionRef = useRef({ oppsSeen: 0, viableSeen: 0, volumeBtc: 0, bestTrade: 0, startTs: 0 });
 
   const walletsRef = useRef(wallets);
   const pnlRef = useRef(pnl);
@@ -85,6 +99,8 @@ export function ArbDashboard() {
     const feed = new LiveFeed();
     feed.start();
     feedRef.current = feed;
+    sessionRef.current.startTs = Date.now();
+    setSession({ ...sessionRef.current });
     return () => feed.close();
   }, []);
 
@@ -132,6 +148,16 @@ export function ArbDashboard() {
       freshnessMs: liveAges.length ? Math.min(...liveAges) : 0,
     });
 
+    // Arbitraje estadístico: z-score del mayor spread bruto sobre ventana móvil.
+    const maxGross = detectedRaw.length ? Math.max(...detectedRaw.map((o) => o.grossBps)) : 0;
+    spreadHistRef.current = pushCapped(spreadHistRef.current, maxGross, 120);
+    setStat({ ...zScore(spreadHistRef.current), current: maxGross });
+
+    // Analítica de sesión: oportunidades vistas.
+    const s = sessionRef.current;
+    s.oppsSeen += detectedRaw.length;
+    s.viableSeen += detected.filter((o) => o.viable).length;
+
     // 3) Circuit breaker
     const r = evaluateRisk(merged, detectedRaw, pnlRef.current, peakPnlRef.current, Date.now());
     setRisk(r);
@@ -155,8 +181,13 @@ export function ArbDashboard() {
         const newPnl = pnlRef.current + gained;
         setPnl(newPnl);
         peakPnlRef.current = Math.max(peakPnlRef.current, newPnl);
+        for (const tr of newTrades) {
+          s.volumeBtc += tr.qty;
+          s.bestTrade = Math.max(s.bestTrade, tr.netProfit);
+        }
       }
     }
+    setSession({ ...s });
     setEquity((prev) => [...prev, { t: Date.now(), pnl: pnlRef.current }].slice(-150));
   }, []);
 
@@ -196,6 +227,9 @@ export function ArbDashboard() {
     peakPnlRef.current = 0;
     setEquity([]);
     setTickCount(0);
+    sessionRef.current = { oppsSeen: 0, viableSeen: 0, volumeBtc: 0, bestTrade: 0, startTs: Date.now() };
+    setSession({ ...sessionRef.current });
+    spreadHistRef.current = [];
   };
 
   const okBooks = books.filter((b) => b.ok);
@@ -370,6 +404,39 @@ export function ArbDashboard() {
           </div>
         </section>
 
+        {/* Heatmap de spreads */}
+        <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5 mt-6">
+          <h2 className="text-lg font-semibold mb-1">Matriz de spreads <span className="text-neutral-500 text-sm font-normal">· neto en bps (compra → vende)</span></h2>
+          <p className="text-sm text-neutral-400 mb-3">Verde = oportunidad neta positiva. Todas las combinaciones de los {EXCHANGES.length} venues a la vez.</p>
+          <SpreadMatrix opps={opps} exchanges={[...EXCHANGES]} />
+        </section>
+
+        {/* Estadístico + Analítica de sesión */}
+        <div className="grid md:grid-cols-2 gap-6 mt-6">
+          <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5">
+            <h2 className="text-lg font-semibold mb-1">Arbitraje estadístico</h2>
+            <p className="text-sm text-neutral-400 mb-3">Z-score del mayor spread bruto vs su media móvil. |z| alto = spread inusual (mean-reversion).</p>
+            <div className="grid grid-cols-3 gap-3 text-center">
+              <div><p className="text-xs text-neutral-400">Spread actual</p><p className="font-mono text-lg">{stat.current.toFixed(1)} bps</p></div>
+              <div><p className="text-xs text-neutral-400">Media móvil</p><p className="font-mono text-lg">{stat.mean.toFixed(1)} bps</p></div>
+              <div><p className="text-xs text-neutral-400">Z-score</p><p className={`font-mono text-lg ${Math.abs(stat.z) > 2 ? "text-amber-400" : ""}`}>{stat.z.toFixed(2)}</p></div>
+            </div>
+            {Math.abs(stat.z) > 2 && <p className="text-amber-400 text-xs mt-3">⚡ Spread {stat.z > 0 ? "inusualmente amplio" : "comprimido"} — posible señal de mean-reversion.</p>}
+          </section>
+
+          <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5">
+            <h2 className="text-lg font-semibold mb-3">Analítica de sesión</h2>
+            <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
+              <Stat label="Tiempo activo" value={fmtDuration(Date.now() - (session.startTs || Date.now()))} />
+              <Stat label="Oportunidades vistas" value={session.oppsSeen.toLocaleString()} />
+              <Stat label="Viables detectadas" value={session.viableSeen.toLocaleString()} />
+              <Stat label="Capture rate" value={session.viableSeen ? `${((trades.length / session.viableSeen) * 100).toFixed(0)}%` : "—"} />
+              <Stat label="Volumen operado" value={`${fmtNum(session.volumeBtc, 3)} BTC`} />
+              <Stat label="Mejor operación" value={fmtUsd(session.bestTrade)} />
+            </div>
+          </section>
+        </div>
+
         {/* Arbitraje triangular */}
         <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5 mt-6">
           <h2 className="text-lg font-semibold mb-1">Arbitraje triangular <span className="text-neutral-500 text-sm font-normal">· Coinbase (USD/BTC/ETH)</span></h2>
@@ -428,6 +495,15 @@ export function ArbDashboard() {
         </p>
       </div>
     </main>
+  );
+}
+
+function Stat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-center justify-between border-b border-neutral-800/40 py-0.5">
+      <span className="text-neutral-400">{label}</span>
+      <span className="font-mono text-neutral-200">{value}</span>
+    </div>
   );
 }
 

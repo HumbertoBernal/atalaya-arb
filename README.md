@@ -46,6 +46,9 @@ Cliente (React, ~1.2s + push WS)
   por latencia de red** + **withdrawal fee amortizado** (rebalanceo).
 - **Circuit breaker**: detiene la ejecución ante datos stale, spread anómalo (dato corrupto) o drawdown.
 - **Arbitraje triangular** intra-exchange (Coinbase USD/BTC/ETH), ambas direcciones del ciclo.
+- **Matriz de spreads** (heatmap exchange × exchange) con el neto en bps de cada combinación.
+- **Arbitraje estadístico**: z-score del mayor spread vs su media móvil (señal de mean-reversion).
+- **Analítica de sesión**: tiempo activo, oportunidades vistas, viables, capture rate, volumen, mejor trade.
 - **Tests**: `pnpm test` (13 casos del motor, deterministas).
 
 ### Decisiones técnicas clave
