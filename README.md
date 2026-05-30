@@ -14,6 +14,24 @@ BTC se transa en cientos de exchanges independientes; sus precios divergen const
 **ask** de un exchange es menor que el **bid** de otro, existe arbitraje. Pero una oportunidad rentable
 en bruto puede ser negativa tras **fees, slippage y liquidez** — y ahí está la verdadera dificultad.
 
+## Tecnologías utilizadas
+
+| Capa | Tecnología |
+|------|-----------|
+| Framework full-stack | **Next.js 16** (App Router) |
+| Lenguaje | **TypeScript** (tipado end-to-end) |
+| UI | **React 19**, **Tailwind CSS v4**, **Recharts** (gráficas) |
+| Backend / API | **Next.js Route Handlers** (BFF server-side; sin backend con estado) |
+| Motor cuant | **TypeScript puro** (funciones puras y testeables en `lib/arb/`) |
+| Tiempo real | **WebSocket** (order book L2 + top-of-book) + **REST** (fallback) |
+| Datos de mercado | APIs públicas de **Coinbase, Kraken, Bitstamp, Gemini, Bitfinex** (sin API keys) |
+| Testing | **tsx** + runner propio (`pnpm test`, 13 casos) |
+| Tooling | **pnpm**, **ESLint**, **MathJax** (render de fórmulas) |
+| Deploy | **Vercel** (producción) · **GitHub** (repo) |
+
+> Decisión deliberada: **sin base de datos ni backend con estado**. El simulador corre en el cliente y solo
+> el fetch de datos va server-side — la demo funciona en vivo sin credenciales ni infraestructura frágil.
+
 ## Cómo funciona
 
 ```
@@ -103,14 +121,23 @@ scripts/test-arb.ts             # test de humo con order books reales
 
 Ver **[DEMO.md](DEMO.md)** para el guion de demo de 90s orientado al jurado.
 
-## Cómo correr
+## Instalación y ejecución
+
+**Prerequisitos:** Node.js 18+ y [pnpm](https://pnpm.io/installation).
 
 ```bash
-cd web
-pnpm install
-pnpm dev            # http://localhost:3000
+git clone https://github.com/HumbertoBernal/atalaya-arb.git
+cd atalaya-arb/web
+
+pnpm install        # instala dependencias
+
+pnpm dev            # desarrollo → http://localhost:3000
 pnpm test           # tests unitarios del motor (13 casos)
+pnpm build          # build de producción
+pnpm start          # sirve el build de producción
 ```
+
+No requiere variables de entorno ni API keys: todos los datos son de endpoints públicos.
 
 ## Qué demuestra (criterios del jurado)
 
