@@ -1,8 +1,11 @@
 // Tests unitarios del motor (sin dependencias externas, deterministas).
 // Ejecutar: pnpm dlx tsx scripts/test-engine.ts
-import { optimalArb, detectOpportunities } from "../src/lib/arb/engine";
+import { optimalArb, detectOpportunities, simulateExecution } from "../src/lib/arb/engine";
 import { detectTriangular } from "../src/lib/arb/triangular";
-import type { OrderBooks } from "../src/lib/arb/types";
+import { overlayWs, isL2Valid, referencePrice, percentile } from "../src/lib/arb/mergeBooks";
+import { zScore, pushCapped } from "../src/lib/arb/stats";
+import { rebalance, needsRebalance } from "../src/lib/arb/rebalance";
+import type { OrderBook, OrderBooks, Wallet } from "../src/lib/arb/types";
 
 let pass = 0;
 let fail = 0;
@@ -71,6 +74,72 @@ console.log("detectTriangular:");
   // Con fee alto (1%/leg, 3 legs ≈ 3%) ninguna debería ser viable.
   const withFee = detectTriangular(books, 0.01);
   check("fees altos → ninguna viable", withFee.every((r) => !r.viable));
+}
+
+const book = (ex: string, bid: number, ask: number, ts = Date.now()): OrderBook => ({
+  exchange: ex, bids: [{ price: bid, qty: 5 }], asks: [{ price: ask, qty: 5 }], ts, latencyMs: 0, ok: true,
+});
+
+console.log("mergeBooks / helpers:");
+{
+  check("percentile vacío = 0", percentile([], 50) === 0);
+  check("percentile p50", percentile([1, 2, 3, 4], 50) === 3);
+  check("referencePrice = mid del primer ok", referencePrice([book("a", 100, 102)]) === 101);
+  check("referencePrice sin libros = 0", referencePrice([]) === 0);
+  // overlayWs: top más fresco reemplaza el nivel 0 si mantiene monotonicidad.
+  const b = book("a", 100, 101, 1000);
+  const o = overlayWs(b, { bid: 100.5, ask: 100.8, ts: 2000 });
+  check("overlayWs aplica top fresco", o.bids[0].price === 100.5 && o.asks[0].price === 100.8);
+  const stale = overlayWs(b, { bid: 100.5, ask: 100.8, ts: 500 });
+  check("overlayWs ignora top viejo", stale.bids[0].price === 100);
+  check("isL2Valid: libro válido y fresco", isL2Valid(book("a", 100, 101, Date.now()), Date.now()));
+  check("isL2Valid: libro cruzado → false", !isL2Valid(book("a", 101, 100, Date.now()), Date.now()));
+}
+
+console.log("stats:");
+{
+  check("zScore n<2 → z=0", zScore([5]).z === 0);
+  const z = zScore([1, 2, 3, 4, 10]);
+  check("zScore último valor alto → z>0", z.z > 0);
+  check("pushCapped respeta el tope", pushCapped([1, 2, 3], 4, 3).length === 3);
+  check("pushCapped descarta el más viejo", pushCapped([1, 2, 3], 4, 3)[0] === 2);
+}
+
+console.log("rebalance:");
+{
+  const wallets: Record<string, Wallet> = {
+    a: { exchange: "a", usd: 0, btc: 4 },
+    b: { exchange: "b", usd: 100000, btc: 0 },
+  };
+  check("needsRebalance detecta agotamiento", needsRebalance(wallets));
+  const { wallets: next, costUsd } = rebalance(wallets, 50000);
+  const totalBtcBefore = 4;
+  const totalBtcAfter = Object.values(next).reduce((s, w) => s + w.btc, 0);
+  check("rebalance conserva BTC (menos fee)", totalBtcAfter < totalBtcBefore && totalBtcAfter > totalBtcBefore - 0.01);
+  check("rebalance reparte USD parejo", Math.abs(next.a.usd - next.b.usd) < 1e-6);
+  check("rebalance tiene costo > 0", costUsd > 0);
+}
+
+console.log("simulateExecution:");
+{
+  const books: OrderBooks = { a: book("a", 99, 100), b: book("b", 110, 111) };
+  const wallets: Record<string, Wallet> = {
+    a: { exchange: "a", usd: 100000, btc: 5 },
+    b: { exchange: "b", usd: 100000, btc: 5 },
+  };
+  const opps = detectOpportunities(books, 0);
+  const viable = opps.find((o) => o.viable)!;
+  const { trade, wallets: next } = simulateExecution(viable, books, wallets, 0);
+  check("simulateExecution genera trade neto-positivo", !!trade && trade.netProfit > 0);
+  if (trade) {
+    const btcBefore = 10;
+    const btcAfter = next.a.btc + next.b.btc;
+    check("conserva BTC total (arb compra=vende)", Math.abs(btcAfter - btcBefore) < 1e-6);
+    check("USD total sube por el neto", next.a.usd + next.b.usd > 200000);
+  }
+  // Sin saldo BTC en el venue de venta → no ejecuta.
+  const noBtc = { a: wallets.a, b: { exchange: "b", usd: 100000, btc: 0 } };
+  check("sin BTC en sellEx → no ejecuta", simulateExecution(viable, books, noBtc, 0).trade === null);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

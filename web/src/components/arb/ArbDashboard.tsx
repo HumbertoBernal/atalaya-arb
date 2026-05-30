@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Area,
   AreaChart,
@@ -9,434 +9,160 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { EXCHANGE_LABEL, EXCHANGES, INITIAL_BTC, INITIAL_USD, MAKER_FEE, TAKER_FEE } from "@/lib/arb/config";
-import { detectOpportunities, simulateExecution } from "@/lib/arb/engine";
-import { LiveFeed, type FeedStatus } from "@/lib/arb/livefeed";
-import { L2Feed } from "@/lib/arb/l2book";
-import { evaluateRisk, sanitizeOpportunities, type RiskState } from "@/lib/arb/risk";
-import { needsRebalance, rebalance } from "@/lib/arb/rebalance";
-import { pushCapped, zScore, type ZScore } from "@/lib/arb/stats";
-import { detectTriangular, type TriBooks, type TriResult } from "@/lib/arb/triangular";
-import type { OrderBook, OrderBooks, Opportunity, Trade, Wallet } from "@/lib/arb/types";
+import { EXCHANGE_LABEL, EXCHANGES } from "@/lib/arb/config";
+import { fmtDuration, fmtNum, fmtUsd } from "@/lib/arb/format";
+import type { FeedStatus } from "@/lib/arb/livefeed";
+import type { OrderBook, Opportunity, Trade, Wallet } from "@/lib/arb/types";
 import { SpreadMatrix } from "./SpreadMatrix";
+import { FEE_TIERS, useArbEngine } from "./useArbEngine";
 
-const POLL_MS = 1200;
-const FEE_TIERS = [
-  { id: "retail", label: "Retail", mult: 1 },
-  { id: "pro", label: "Pro", mult: 0.4 },
-  { id: "vip", label: "VIP / HFT", mult: 0.1 },
-  { id: "maker", label: "Maker 0%", mult: 0 },
-] as const;
-
-function initWallets(): Record<string, Wallet> {
-  const w: Record<string, Wallet> = {};
-  for (const ex of Object.keys(TAKER_FEE)) w[ex] = { exchange: ex, usd: INITIAL_USD, btc: INITIAL_BTC };
-  return w;
-}
-
-const fmtUsd = (n: number) =>
-  n.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
-const fmtNum = (n: number, d = 4) => n.toLocaleString("en-US", { maximumFractionDigits: d });
-
-function pctile(arr: number[], p: number): number {
-  if (!arr.length) return 0;
-  const sorted = [...arr].sort((a, b) => a - b);
-  const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
-  return sorted[idx];
-}
-
-function fmtDuration(ms: number): string {
-  const s = Math.floor(ms / 1000);
-  const m = Math.floor(s / 60);
-  const h = Math.floor(m / 60);
-  if (h > 0) return `${h}h ${m % 60}m`;
-  return `${m}m ${s % 60}s`;
-}
-
-// Mezcla el top-of-book de WS (más fresco) sobre la profundidad del REST,
-// con guardia de monotonicidad para no romper el order book.
-function overlayWs(book: OrderBook, top?: { bid: number; ask: number; ts: number }): OrderBook {
-  if (!book.ok || !top || top.ts <= book.ts || !book.bids.length || !book.asks.length) return book;
-  const bids = [...book.bids];
-  const asks = [...book.asks];
-  if (!bids[1] || top.bid >= bids[1].price) bids[0] = { price: top.bid, qty: bids[0].qty };
-  if (!asks[1] || top.ask <= asks[1].price) asks[0] = { price: top.ask, qty: asks[0].qty };
-  return { ...book, bids, asks, ts: top.ts, latencyMs: 0 };
+// Flash verde/rojo cuando un valor sube/baja (técnica de trading terminals).
+function useFlash(value: number) {
+  const prev = useRef(value);
+  const [dir, setDir] = useState<"up" | "down" | null>(null);
+  useEffect(() => {
+    if (value > prev.current) setDir("up");
+    else if (value < prev.current) setDir("down");
+    prev.current = value;
+    const id = setTimeout(() => setDir(null), 400);
+    return () => clearTimeout(id);
+  }, [value]);
+  return dir === "up" ? "flash-up" : dir === "down" ? "flash-down" : "";
 }
 
 export function ArbDashboard() {
-  const [books, setBooks] = useState<OrderBook[]>([]);
-  const [opps, setOpps] = useState<Opportunity[]>([]);
-  const [trades, setTrades] = useState<Trade[]>([]);
-  const [wallets, setWallets] = useState<Record<string, Wallet>>(initWallets);
-  const [pnl, setPnl] = useState(0);
-  const [equity, setEquity] = useState<{ t: number; pnl: number }[]>([]);
-  const [running, setRunning] = useState(true);
-  const [feeTier, setFeeTier] = useState<(typeof FEE_TIERS)[number]["id"]>("vip");
-  const [makerMode, setMakerMode] = useState(false);
-  const [serverLatency, setServerLatency] = useState(0);
-  const [tickCount, setTickCount] = useState(0);
-  const [feedStatus, setFeedStatus] = useState<Record<string, FeedStatus>>({});
-  const [risk, setRisk] = useState<RiskState>({ tripped: false, reasons: [], maxBookAgeMs: 0 });
-  const [tri, setTri] = useState<{ results: TriResult[]; ts: number } | null>(null);
-  const [metrics, setMetrics] = useState({ detP50: 0, detP99: 0, wsRate: 0, freshnessMs: 0 });
-  const detTimesRef = useRef<number[]>([]);
-  const [stat, setStat] = useState<ZScore & { current: number }>({ mean: 0, std: 0, z: 0, n: 0, current: 0 });
-  const spreadHistRef = useRef<number[]>([]);
-  const [session, setSession] = useState({ oppsSeen: 0, viableSeen: 0, volumeBtc: 0, bestTrade: 0, rebalances: 0, startTs: 0 });
-  const sessionRef = useRef({ oppsSeen: 0, viableSeen: 0, volumeBtc: 0, bestTrade: 0, rebalances: 0, startTs: 0 });
-
-  const walletsRef = useRef(wallets);
-  const pnlRef = useRef(pnl);
-  const peakPnlRef = useRef(0);
-  const runningRef = useRef(running);
-  const feeRef = useRef(feeTier);
-  const makerRef = useRef(makerMode);
-  const feedRef = useRef<LiveFeed | null>(null);
-  const l2Ref = useRef<L2Feed | null>(null);
-  walletsRef.current = wallets;
-  pnlRef.current = pnl;
-  runningRef.current = running;
-  feeRef.current = feeTier;
-  makerRef.current = makerMode;
-
-  // Arranca los feeds WebSocket una vez: top-of-book (LiveFeed) + L2 completo (L2Feed).
-  useEffect(() => {
-    const feed = new LiveFeed();
-    feed.start();
-    feedRef.current = feed;
-    const l2 = new L2Feed();
-    l2.start();
-    l2Ref.current = l2;
-    sessionRef.current.startTs = Date.now();
-    setSession({ ...sessionRef.current });
-    return () => {
-      feed.close();
-      l2.close();
-    };
-  }, []);
-
-  const tick = useCallback(async () => {
-    const mult = FEE_TIERS.find((t) => t.id === feeRef.current)?.mult ?? 1;
-
-    // 1) REST: profundidad. 2) overlay top-of-book de WS (fresco).
-    let payload: { books: OrderBook[]; serverLatencyMs: number };
-    try {
-      const res = await fetch("/api/orderbooks", { cache: "no-store" });
-      payload = await res.json();
-    } catch {
-      return;
-    }
-    const tops = feedRef.current?.getTops() ?? {};
-    const l2books = l2Ref.current?.getBooks() ?? {};
-    const now = Date.now();
-    const map: OrderBooks = {};
-    const merged: OrderBook[] = [];
-    for (const b of payload.books) {
-      const l2 = l2books[b.exchange];
-      // Preferir el libro L2 por WebSocket (profundidad en tiempo real) si está
-      // fresco Y es válido (no cruzado); si no, caer al REST con overlay.
-      const l2Valid =
-        l2 && l2.bids.length && l2.asks.length && now - l2.ts < 5000 && l2.bids[0].price < l2.asks[0].price;
-      const m = l2Valid ? { ...l2, latencyMs: 0 } : overlayWs(b, tops[b.exchange]);
-      map[b.exchange] = m;
-      merged.push(m);
-    }
-    setBooks(merged);
-    setServerLatency(payload.serverLatencyMs);
-    // Estado de feed combinado: L2 (4 venues) + top-of-book (coinbase).
-    const l2Status = l2Ref.current?.getStatus() ?? {};
-    const topStatus = feedRef.current?.getStatus() ?? {};
-    setFeedStatus({ ...topStatus, ...l2Status });
-    setTickCount((c) => c + 1);
-
-    const maker = makerRef.current;
-    const t0 = performance.now();
-    const detectedRaw = detectOpportunities(map, mult, maker);
-    const detMs = performance.now() - t0;
-    const detected = sanitizeOpportunities(detectedRaw);
-    setOpps(detected);
-
-    // Métricas de latencia/throughput
-    const buf = detTimesRef.current;
-    buf.push(detMs);
-    if (buf.length > 100) buf.shift();
-    const rates = feedRef.current?.getRates() ?? {};
-    const l2Rates = l2Ref.current?.getRates() ?? {};
-    const wsRate =
-      Object.values(rates).reduce((a, b) => a + b, 0) +
-      Object.values(l2Rates).reduce((a, b) => a + b, 0);
-    const liveAges = merged.filter((b) => b.ok).map((b) => Date.now() - b.ts);
-    setMetrics({
-      detP50: pctile(buf, 50),
-      detP99: pctile(buf, 99),
-      wsRate,
-      freshnessMs: liveAges.length ? Math.min(...liveAges) : 0,
-    });
-
-    // Arbitraje estadístico: z-score del mayor spread bruto sobre ventana móvil.
-    const maxGross = detectedRaw.length ? Math.max(...detectedRaw.map((o) => o.grossBps)) : 0;
-    spreadHistRef.current = pushCapped(spreadHistRef.current, maxGross, 120);
-    setStat({ ...zScore(spreadHistRef.current), current: maxGross });
-
-    // Analítica de sesión: oportunidades vistas.
-    const s = sessionRef.current;
-    s.oppsSeen += detectedRaw.length;
-    s.viableSeen += detected.filter((o) => o.viable).length;
-
-    // 3) Circuit breaker
-    const r = evaluateRisk(merged, detectedRaw, pnlRef.current, peakPnlRef.current, Date.now());
-    setRisk(r);
-
-    // 4) Ejecución (solo si corre y el breaker no está disparado)
-    if (runningRef.current && !r.tripped) {
-      let w = walletsRef.current;
-      const newTrades: Trade[] = [];
-      let gained = 0;
-      for (const opp of detected.filter((o) => o.viable)) {
-        const { trade, wallets: nextW } = simulateExecution(opp, map, w, mult, maker);
-        if (trade) {
-          w = nextW;
-          newTrades.push(trade);
-          gained += trade.netProfit;
-        }
-      }
-
-      // Rebalanceo de inventario si algún venue se agotó (paga fees de red).
-      let rebalanceCost = 0;
-      const okB = merged.find((b) => b.ok && b.bids.length && b.asks.length);
-      const refP = okB ? (okB.bids[0].price + okB.asks[0].price) / 2 : 0;
-      if (refP && needsRebalance(w)) {
-        const rb = rebalance(w, refP);
-        w = rb.wallets;
-        rebalanceCost = rb.costUsd;
-        s.rebalances += 1;
-      }
-
-      if (newTrades.length || rebalanceCost > 0) {
-        setWallets(w);
-        const newPnl = pnlRef.current + gained - rebalanceCost;
-        setPnl(newPnl);
-        peakPnlRef.current = Math.max(peakPnlRef.current, newPnl);
-        if (newTrades.length) {
-          setTrades((prev) => [...newTrades.reverse(), ...prev].slice(0, 60));
-          for (const tr of newTrades) {
-            s.volumeBtc += tr.qty;
-            s.bestTrade = Math.max(s.bestTrade, tr.netProfit);
-          }
-        }
-      }
-    }
-    setSession({ ...s });
-    setEquity((prev) => [...prev, { t: Date.now(), pnl: pnlRef.current }].slice(-150));
-  }, []);
-
-  useEffect(() => {
-    tick();
-    const id = setInterval(tick, POLL_MS);
-    return () => clearInterval(id);
-  }, [tick]);
-
-  // Poll del triangular (Coinbase, 3 pares).
-  useEffect(() => {
-    let alive = true;
-    const run = async () => {
-      try {
-        const res = await fetch("/api/triangular", { cache: "no-store" });
-        const d = await res.json();
-        if (!alive || !d.ok) return;
-        const mult = FEE_TIERS.find((t) => t.id === feeRef.current)?.mult ?? 1;
-        const base = makerRef.current ? (MAKER_FEE.coinbase ?? 0.004) : (TAKER_FEE.coinbase ?? 0.006);
-        setTri({ results: detectTriangular(d.books as TriBooks, base * mult), ts: d.ts });
-      } catch {
-        /* noop */
-      }
-    };
-    run();
-    const id = setInterval(run, 2500);
-    return () => {
-      alive = false;
-      clearInterval(id);
-    };
-  }, []);
-
-  const reset = () => {
-    setWallets(initWallets());
-    setTrades([]);
-    setPnl(0);
-    peakPnlRef.current = 0;
-    setEquity([]);
-    setTickCount(0);
-    sessionRef.current = { oppsSeen: 0, viableSeen: 0, volumeBtc: 0, bestTrade: 0, rebalances: 0, startTs: Date.now() };
-    setSession({ ...sessionRef.current });
-    spreadHistRef.current = [];
-  };
-
-  const okBooks = books.filter((b) => b.ok);
-  const viableCount = opps.filter((o) => o.viable).length;
-  const totalUsd = Object.values(wallets).reduce((s, w) => s + w.usd, 0);
-  const totalBtc = Object.values(wallets).reduce((s, w) => s + w.btc, 0);
-  const partialCount = trades.filter((t) => t.partial).length;
-  const wsLive = Object.values(feedStatus).filter((s) => s === "live").length;
+  const e = useArbEngine();
+  const okBooks = e.books.filter((b) => b.ok);
+  const viableCount = e.opps.filter((o) => o.viable).length;
+  const totalUsd = Object.values(e.wallets).reduce((s, w) => s + w.usd, 0);
+  const totalBtc = Object.values(e.wallets).reduce((s, w) => s + w.btc, 0);
+  const partialCount = e.trades.filter((t) => t.partial).length;
+  const wsLive = Object.values(e.feedStatus).filter((s) => s === "live").length;
+  const loading = e.books.length === 0;
 
   return (
-    <main className="min-h-screen bg-neutral-950 text-neutral-100 px-4 md:px-6 py-8">
-      <div className="mx-auto max-w-6xl">
+    <main className="min-h-screen text-neutral-100 px-4 md:px-6 py-8">
+      <div className="mx-auto max-w-7xl">
+        {/* Header */}
         <header className="mb-6 flex flex-wrap items-end justify-between gap-4">
           <div>
             <h1 className="text-2xl md:text-3xl font-bold tracking-tight">
-              Atalaya <span className="text-indigo-400">· Arbitraje BTC</span>
+              Atalaya <span className="text-amber-400">· Arbitraje BTC</span>
             </h1>
-            <p className="text-neutral-400 text-sm mt-1">
+            <p className="text-neutral-400 text-sm mt-1 max-w-2xl">
               Detección en tiempo real (WebSocket) de divergencias entre exchanges, ejecución simulada neta
               de fees, slippage, latencia y retiros.
             </p>
-            <a
-              href="/como-funciona.html"
-              className="inline-block mt-2 text-sm text-indigo-400 hover:text-indigo-300"
-            >
+            <a href="/como-funciona.html" className="inline-block mt-2 text-sm text-amber-400 hover:text-amber-300">
               Cómo funciona y la matemática →
             </a>
           </div>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => setRunning((r) => !r)}
-              className={`px-3 py-1.5 rounded-lg text-sm font-medium ${
-                running ? "bg-amber-600 hover:bg-amber-500" : "bg-emerald-600 hover:bg-emerald-500"
+              onClick={e.toggleRunning}
+              className={`px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+                e.running ? "bg-amber-600 hover:bg-amber-500" : "bg-emerald-600 hover:bg-emerald-500"
               }`}
             >
-              {running ? "⏸ Pausar" : "▶ Reanudar"}
+              {e.running ? "⏸ Pausar" : "▶ Reanudar"}
             </button>
-            <button onClick={reset} className="px-3 py-1.5 rounded-lg text-sm font-medium bg-neutral-800 hover:bg-neutral-700">
+            <button onClick={e.reset} className="px-3 py-2 rounded-lg text-sm font-medium bg-neutral-800 hover:bg-neutral-700 transition-colors">
               ↺ Reset
             </button>
           </div>
         </header>
 
         {/* Circuit breaker */}
-        {risk.tripped && (
+        {e.risk.tripped && (
           <div className="mb-5 rounded-lg border border-rose-700 bg-rose-950/40 p-3 text-sm text-rose-200">
-            <strong>🛑 Circuit breaker activo</strong> — ejecución detenida: {risk.reasons.join(" · ")}
+            <strong>🛑 Circuit breaker activo</strong> — ejecución detenida: {e.risk.reasons.join(" · ")}
           </div>
         )}
 
-        {/* KPIs */}
-        <section className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
-          <Kpi label="P&L realizado" value={fmtUsd(pnl)} accent={pnl >= 0} big />
-          <Kpi label="Operaciones" value={`${trades.length}`} sub={`${partialCount} parciales`} />
-          <Kpi label="Oportunidades viables" value={`${viableCount}`} sub={`de ${opps.length} detectadas`} />
-          <Kpi label="Feeds" value={`${wsLive} WS · ${okBooks.length}/${books.length} REST`} sub={`${serverLatency}ms · tick #${tickCount}`} />
+        {/* Hero: el P&L domina */}
+        <section className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+          <div className="md:col-span-2 rounded-2xl border border-neutral-800 bg-gradient-to-br from-neutral-900 to-neutral-950 p-6">
+            <p className="text-xs uppercase tracking-[0.2em] text-neutral-500">P&L realizado</p>
+            <p className={`mt-1 font-mono text-5xl md:text-6xl font-semibold tracking-tight ${e.pnl >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
+              {fmtUsd(e.pnl)}
+            </p>
+            <div className="mt-3 flex flex-wrap gap-x-6 gap-y-1 text-xs text-neutral-500">
+              <span><span className="text-neutral-300 font-mono">{e.trades.length}</span> operaciones · {partialCount} parciales</span>
+              <span><span className="text-neutral-300 font-mono">{fmtNum(totalBtc, 2)}</span> BTC inventario</span>
+              <span className="capitalize">Modo: {e.makerMode ? "maker" : "taker"} · {FEE_TIERS.find((t) => t.id === e.feeTier)?.label}</span>
+            </div>
+          </div>
+          <div className="rounded-2xl border border-emerald-900/40 bg-emerald-950/20 p-6 flex flex-col justify-center">
+            <p className="text-xs uppercase tracking-[0.2em] text-emerald-500/70">Viables ahora</p>
+            <p className="font-mono text-4xl md:text-5xl text-emerald-300 mt-1">{viableCount}</p>
+            <p className="text-xs text-neutral-500 mt-1">de {e.opps.length} divergencias detectadas</p>
+          </div>
         </section>
 
-        {/* Control de fees */}
-        <section className="mb-6 flex flex-wrap items-center gap-2 text-sm">
-          <span className="text-neutral-400">Tier de fees:</span>
+        {/* Controles */}
+        <section className="mb-5 flex flex-wrap items-center gap-2 text-sm">
+          <span className="text-neutral-400 inline-flex items-center">
+            Tier de fees
+            <InfoTip>Simula qué comisión pagas, de retail (~0.4%) a HFT (~0). El mismo spread se vuelve rentable o no según el tier — por eso el arbitraje es un juego de bajo fee / alto volumen.</InfoTip>:
+          </span>
           {FEE_TIERS.map((t) => (
-            <button
-              key={t.id}
-              onClick={() => setFeeTier(t.id)}
-              className={`px-2.5 py-1 rounded-full border ${
-                feeTier === t.id
-                  ? "border-indigo-400 bg-indigo-500/20 text-indigo-200"
-                  : "border-neutral-700 text-neutral-300 hover:border-neutral-500"
-              }`}
-            >
-              {t.label}
-            </button>
+            <Toggle key={t.id} active={e.feeTier === t.id} onClick={() => e.setFeeTier(t.id)}>{t.label}</Toggle>
           ))}
           <span className="mx-2 text-neutral-700">|</span>
-          <span className="text-neutral-400">Ejecución:</span>
-          <button
-            onClick={() => setMakerMode(false)}
-            className={`px-2.5 py-1 rounded-full border ${!makerMode ? "border-indigo-400 bg-indigo-500/20 text-indigo-200" : "border-neutral-700 text-neutral-300 hover:border-neutral-500"}`}
-          >
-            Taker
-          </button>
-          <button
-            onClick={() => setMakerMode(true)}
-            className={`px-2.5 py-1 rounded-full border ${makerMode ? "border-indigo-400 bg-indigo-500/20 text-indigo-200" : "border-neutral-700 text-neutral-300 hover:border-neutral-500"}`}
-          >
-            Maker (límite)
-          </button>
-          <span className="text-neutral-500 text-xs ml-1 w-full md:w-auto">
-            {makerMode
-              ? "Maker: órdenes límite con fees menores (más viable en retail), pero solo se llenan ~55% de las veces — riesgo de ejecución modelado."
-              : "Taker: ejecución inmediata. Con fees retail el arbitraje BTC/USD rara vez es neto-positivo; a fees HFT o en modo Maker aparecen ejecuciones."}
+          <span className="text-neutral-400 inline-flex items-center">
+            Ejecución
+            <InfoTip>Taker = orden inmediata (fee mayor). Maker = orden límite (fee menor, viable en retail) pero solo se llena ~55% de las veces — modelamos ese riesgo de ejecución.</InfoTip>:
           </span>
+          <Toggle active={!e.makerMode} onClick={() => e.setMakerMode(false)}>Taker</Toggle>
+          <Toggle active={e.makerMode} onClick={() => e.setMakerMode(true)}>Maker (límite)</Toggle>
         </section>
 
-        {/* Métricas de rendimiento */}
+        {/* Métricas (status strip secundario) */}
         <section className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
-          <Metric label="Detección p50" value={`${metrics.detP50.toFixed(2)} ms`} good={metrics.detP50 < 1} />
-          <Metric label="Detección p99" value={`${metrics.detP99.toFixed(2)} ms`} good={metrics.detP99 < 3} />
-          <Metric label="WS msgs/seg" value={`${metrics.wsRate}`} good={metrics.wsRate > 0} />
-          <Metric label="Frescura datos" value={`${metrics.freshnessMs} ms`} good={metrics.freshnessMs < 1500} />
+          <Metric label="Detección p50" tip="Tiempo de cómputo del motor por tick (mediana)." value={`${e.metrics.detP50.toFixed(2)} ms`} good={e.metrics.detP50 < 1} />
+          <Metric label="Detección p99" value={`${e.metrics.detP99.toFixed(2)} ms`} good={e.metrics.detP99 < 3} />
+          <Metric label="WS msgs/seg" tip="Mensajes WebSocket procesados por segundo (throughput)." value={`${e.metrics.wsRate}`} good={e.metrics.wsRate > 0} />
+          <Metric label="Frescura datos" value={`${e.metrics.freshnessMs} ms`} good={e.metrics.freshnessMs < 1500} />
         </section>
 
+        <SectionHeader n="01" title="En vivo" />
         <div className="grid lg:grid-cols-2 gap-6">
-          {/* Order books */}
-          <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5">
-            <h2 className="text-lg font-semibold mb-3">Mercado en vivo</h2>
-            <div className="space-y-2">
-              {books.map((b) => (
-                <div key={b.exchange} className="flex items-center justify-between text-sm py-1.5 border-b border-neutral-800/50">
-                  <span className="font-medium w-24 flex items-center gap-1.5">
-                    {EXCHANGE_LABEL[b.exchange] ?? b.exchange}
-                    {feedStatus[b.exchange] === "live" ? (
-                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" title="WebSocket en vivo" />
-                    ) : (
-                      <span className="w-1.5 h-1.5 rounded-full bg-neutral-600" title="REST" />
-                    )}
-                  </span>
-                  {b.ok ? (
-                    <>
-                      <span className="text-emerald-400 font-mono">bid {fmtUsd(b.bids[0]?.price ?? 0)}</span>
-                      <span className="text-rose-400 font-mono">ask {fmtUsd(b.asks[0]?.price ?? 0)}</span>
-                      <span className="text-neutral-500 text-xs w-20 text-right">
-                        {feedStatus[b.exchange] === "live" ? "WS" : `${b.latencyMs}ms`}
-                      </span>
-                    </>
-                  ) : (
-                    <span className="text-amber-500 text-xs">offline: {b.error}</span>
-                  )}
-                </div>
-              ))}
+          {/* Mercado en vivo */}
+          <Panel title="Mercado en vivo" right={`${wsLive} WS · ${okBooks.length}/${e.books.length} REST`}>
+            <div className="space-y-1">
+              {loading
+                ? Array.from({ length: 5 }).map((_, i) => <SkeletonRow key={i} />)
+                : e.books.map((b) => <BookRow key={b.exchange} book={b} status={e.feedStatus[b.exchange]} />)}
             </div>
-          </section>
+          </Panel>
 
           {/* P&L chart */}
-          <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5">
-            <h2 className="text-lg font-semibold mb-3">P&L acumulado</h2>
-            {equity.length > 1 ? (
-              <ResponsiveContainer width="100%" height={200}>
-                <AreaChart data={equity}>
-                  <defs>
-                    <linearGradient id="pnl" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor="#34d399" stopOpacity={0.5} />
-                      <stop offset="100%" stopColor="#34d399" stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
-                  <XAxis dataKey="t" hide />
-                  <YAxis tick={{ fontSize: 11 }} stroke="#888" tickFormatter={(v) => `$${v.toFixed(0)}`} width={56} />
-                  <Tooltip formatter={(v) => [fmtUsd(Number(v)), "P&L"]} labelFormatter={() => ""} contentStyle={{ background: "#1e1e2e", border: "none", borderRadius: 8, fontSize: 12 }} />
-                  <Area type="monotone" dataKey="pnl" stroke="#34d399" strokeWidth={2} fill="url(#pnl)" />
-                </AreaChart>
-              </ResponsiveContainer>
-            ) : (
-              <p className="text-neutral-500 text-sm py-12 text-center">Acumulando datos…</p>
-            )}
-          </section>
+          <Panel title="P&L acumulado">
+            <ResponsiveContainer width="100%" height={210}>
+              <AreaChart data={e.equity.length > 1 ? e.equity : [{ t: 0, pnl: 0 }, { t: 1, pnl: 0 }]}>
+                <defs>
+                  <linearGradient id="pnl" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#34d399" stopOpacity={0.5} />
+                    <stop offset="100%" stopColor="#34d399" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <XAxis dataKey="t" hide />
+                <YAxis tick={{ fontSize: 11 }} stroke="#666" tickFormatter={(v) => `$${v.toFixed(0)}`} width={56} />
+                <Tooltip formatter={(v) => [fmtUsd(Number(v)), "P&L"]} labelFormatter={() => ""} contentStyle={{ background: "#15151a", border: "1px solid #26262e", borderRadius: 8, fontSize: 12 }} />
+                <Area type="monotone" dataKey="pnl" stroke="#34d399" strokeWidth={2} fill="url(#pnl)" isAnimationActive={false} />
+              </AreaChart>
+            </ResponsiveContainer>
+          </Panel>
         </div>
 
-        {/* Oportunidades cross-exchange */}
-        <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5 mt-6">
-          <h2 className="text-lg font-semibold mb-3">Oportunidades cross-exchange</h2>
+        {/* Oportunidades */}
+        <Panel className="mt-6" title="Oportunidades cross-exchange">
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead className="text-neutral-400 border-b border-neutral-800">
                 <tr>
                   <th className="text-left py-2">Comprar → Vender</th>
-                  <th className="text-right">Bruto</th>
+                  <th className="text-right">Bruto <InfoTip>Spread en puntos básicos (1 bps = 0.01%) antes de costos.</InfoTip></th>
                   <th className="text-right">Vol.</th>
                   <th className="text-right">Fees</th>
                   <th className="text-right">Latencia</th>
@@ -445,7 +171,10 @@ export function ArbDashboard() {
                 </tr>
               </thead>
               <tbody>
-                {opps.slice(0, 8).map((o) => (
+                {loading && Array.from({ length: 4 }).map((_, i) => (
+                  <tr key={i}><td colSpan={7} className="py-2"><div className="h-3 rounded bg-neutral-800 animate-pulse" /></td></tr>
+                ))}
+                {!loading && e.opps.slice(0, 8).map((o) => (
                   <tr key={`${o.buyEx}-${o.sellEx}`} className="border-b border-neutral-800/40">
                     <td className="py-2">{EXCHANGE_LABEL[o.buyEx]} → {EXCHANGE_LABEL[o.sellEx]}</td>
                     <td className="text-right font-mono">{o.grossBps.toFixed(1)} bps</td>
@@ -453,79 +182,73 @@ export function ArbDashboard() {
                     <td className="text-right font-mono text-neutral-500">{fmtUsd(o.feesCost)}</td>
                     <td className="text-right font-mono text-neutral-500">{fmtUsd(o.latencyCost)}</td>
                     <td className={`text-right font-mono ${o.netProfit > 0 ? "text-emerald-400" : "text-neutral-500"}`}>{fmtUsd(o.netProfit)}</td>
-                    <td className="text-right">
-                      {o.viable ? <span className="text-emerald-400 text-xs">✓ viable</span> : <span className="text-neutral-500 text-xs">no neto</span>}
-                    </td>
+                    <td className="text-right">{o.viable ? <span className="text-emerald-400 text-xs">✓ viable</span> : <span className="text-neutral-500 text-xs">no neto</span>}</td>
                   </tr>
                 ))}
-                {opps.length === 0 && (
-                  <tr><td colSpan={7} className="text-center text-neutral-500 py-4">Sin divergencias brutas en este instante.</td></tr>
+                {!loading && e.opps.length === 0 && (
+                  <tr><td colSpan={7} className="text-center text-neutral-500 py-4">Mercado eficiente ahora mismo — sin divergencias netas. Prueba el tier VIP/Maker.</td></tr>
                 )}
               </tbody>
             </table>
           </div>
-        </section>
+        </Panel>
 
-        {/* Heatmap de spreads */}
-        <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5 mt-6">
-          <h2 className="text-lg font-semibold mb-1">Matriz de spreads <span className="text-neutral-500 text-sm font-normal">· neto en bps (compra → vende)</span></h2>
-          <p className="text-sm text-neutral-400 mb-3">Verde = oportunidad neta positiva. Todas las combinaciones de los {EXCHANGES.length} venues a la vez.</p>
-          <SpreadMatrix opps={opps} exchanges={[...EXCHANGES]} />
-        </section>
+        <SectionHeader n="02" title="Análisis" className="mt-10" />
+        {/* Heatmap */}
+        <Panel title="Matriz de spreads" subtitle="neto en bps · compra → vende">
+          <p className="text-sm text-neutral-400 mb-3">Verde = oportunidad neta positiva. Las {EXCHANGES.length}×{EXCHANGES.length} combinaciones a la vez.</p>
+          <SpreadMatrix opps={e.opps} exchanges={[...EXCHANGES]} />
+        </Panel>
 
-        {/* Estadístico + Analítica de sesión */}
         <div className="grid md:grid-cols-2 gap-6 mt-6">
-          <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5">
-            <h2 className="text-lg font-semibold mb-1">Arbitraje estadístico</h2>
-            <p className="text-sm text-neutral-400 mb-3">Z-score del mayor spread bruto vs su media móvil. |z| alto = spread inusual (mean-reversion).</p>
+          <Panel title="Arbitraje estadístico">
+            <p className="text-sm text-neutral-400 mb-3">Z-score del mayor spread vs su media móvil. |z| alto = spread inusual (mean-reversion).</p>
             <div className="grid grid-cols-3 gap-3 text-center">
-              <div><p className="text-xs text-neutral-400">Spread actual</p><p className="font-mono text-lg">{stat.current.toFixed(1)} bps</p></div>
-              <div><p className="text-xs text-neutral-400">Media móvil</p><p className="font-mono text-lg">{stat.mean.toFixed(1)} bps</p></div>
-              <div><p className="text-xs text-neutral-400">Z-score</p><p className={`font-mono text-lg ${Math.abs(stat.z) > 2 ? "text-amber-400" : ""}`}>{stat.z.toFixed(2)}</p></div>
+              <Cell label="Spread actual" value={`${e.stat.current.toFixed(1)} bps`} />
+              <Cell label="Media móvil" value={`${e.stat.mean.toFixed(1)} bps`} />
+              <Cell label="Z-score" value={e.stat.z.toFixed(2)} highlight={Math.abs(e.stat.z) > 2} />
             </div>
-            {Math.abs(stat.z) > 2 && <p className="text-amber-400 text-xs mt-3">⚡ Spread {stat.z > 0 ? "inusualmente amplio" : "comprimido"} — posible señal de mean-reversion.</p>}
-          </section>
+            {Math.abs(e.stat.z) > 2 && <p className="text-amber-400 text-xs mt-3">⚡ Spread {e.stat.z > 0 ? "inusualmente amplio" : "comprimido"} — posible mean-reversion.</p>}
+          </Panel>
 
-          <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5">
-            <h2 className="text-lg font-semibold mb-3">Analítica de sesión</h2>
-            <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
-              <Stat label="Tiempo activo" value={fmtDuration(Date.now() - (session.startTs || Date.now()))} />
-              <Stat label="Oportunidades vistas" value={session.oppsSeen.toLocaleString()} />
-              <Stat label="Viables detectadas" value={session.viableSeen.toLocaleString()} />
-              <Stat label="Capture rate" value={session.viableSeen ? `${((trades.length / session.viableSeen) * 100).toFixed(0)}%` : "—"} />
-              <Stat label="Volumen operado" value={`${fmtNum(session.volumeBtc, 3)} BTC`} />
-              <Stat label="Mejor operación" value={fmtUsd(session.bestTrade)} />
-              <Stat label="Rebalanceos" value={`${session.rebalances}`} />
+          <Panel title="Analítica de sesión">
+            <div className="grid grid-cols-2 gap-x-6 gap-y-1 text-sm">
+              <Stat label="Tiempo activo" value={fmtDuration(Date.now() - (e.session.startTs || Date.now()))} />
+              <Stat label="Oportunidades vistas" value={e.session.oppsSeen.toLocaleString()} />
+              <Stat label="Viables detectadas" value={e.session.viableSeen.toLocaleString()} />
+              <Stat label="Capture rate" value={e.session.viableSeen ? `${((e.trades.length / e.session.viableSeen) * 100).toFixed(0)}%` : "—"} />
+              <Stat label="Volumen operado" value={`${fmtNum(e.session.volumeBtc, 3)} BTC`} />
+              <Stat label="Mejor operación" value={fmtUsd(e.session.bestTrade)} />
+              <Stat label="Rebalanceos" value={`${e.session.rebalances}`} />
             </div>
-          </section>
+          </Panel>
         </div>
 
-        {/* Arbitraje triangular */}
-        <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5 mt-6">
-          <h2 className="text-lg font-semibold mb-1">Arbitraje triangular <span className="text-neutral-500 text-sm font-normal">· Coinbase (USD/BTC/ETH)</span></h2>
+        {/* Triangular */}
+        <Panel className="mt-6" title="Arbitraje triangular" subtitle="Coinbase · USD/BTC/ETH">
           <p className="text-sm text-neutral-400 mb-3">Ciclos intra-exchange sin mover fondos entre plataformas.</p>
           <div className="grid sm:grid-cols-2 gap-3">
-            {tri?.results.map((r) => (
-              <div key={r.direction} className="rounded-lg border border-neutral-800 bg-neutral-950/50 p-3">
-                <div className="font-mono text-xs text-neutral-300">{r.direction}</div>
-                <div className="flex items-center justify-between mt-1">
-                  <span className={`text-lg font-semibold ${r.viable ? "text-emerald-400" : "text-rose-400"}`}>{r.netBps.toFixed(1)} bps</span>
-                  <span className="text-xs text-neutral-500">{r.viable ? "✓ viable" : "no rentable"}</span>
-                </div>
-              </div>
-            ))}
-            {!tri && <p className="text-neutral-500 text-sm">Conectando…</p>}
+            {e.tri
+              ? e.tri.results.map((r) => (
+                  <div key={r.direction} className="rounded-lg border border-neutral-800 bg-neutral-950/50 p-3">
+                    <div className="font-mono text-xs text-neutral-300">{r.direction}</div>
+                    <div className="flex items-center justify-between mt-1">
+                      <span className={`text-lg font-semibold font-mono ${r.viable ? "text-emerald-400" : "text-rose-400"}`}>{r.netBps.toFixed(1)} bps</span>
+                      <span className="text-xs text-neutral-500">{r.viable ? "✓ viable" : "no rentable"}</span>
+                    </div>
+                  </div>
+                ))
+              : Array.from({ length: 2 }).map((_, i) => <div key={i} className="h-16 rounded-lg bg-neutral-900 animate-pulse" />)}
           </div>
-        </section>
+        </Panel>
 
-        {/* Trades + Wallets */}
-        <div className="grid lg:grid-cols-2 gap-6 mt-6">
-          <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5">
-            <h2 className="text-lg font-semibold mb-3">Operaciones ejecutadas</h2>
-            <div className="space-y-1.5 max-h-72 overflow-y-auto">
-              {trades.length === 0 && <p className="text-neutral-500 text-sm">Aún sin operaciones netas-positivas.</p>}
-              {trades.map((t) => (
-                <div key={t.id + t.ts} className="flex items-center justify-between text-xs py-1 border-b border-neutral-800/40">
+        <SectionHeader n="03" title="Ledger" className="mt-10" />
+        <div className="grid lg:grid-cols-2 gap-6">
+          <Panel title="Operaciones ejecutadas">
+            <div className="space-y-1 max-h-72 overflow-y-auto">
+              {e.trades.length === 0 && <p className="text-neutral-500 text-sm">Aún sin operaciones netas-positivas.</p>}
+              {e.trades.map((t) => (
+                <div key={t.id + t.ts} className="row-enter flex items-center justify-between text-xs py-1 border-b border-neutral-800/40">
                   <span className="text-neutral-300">
                     {EXCHANGE_LABEL[t.buyEx]} → {EXCHANGE_LABEL[t.sellEx]}
                     {t.partial && <span className="text-amber-500 ml-1">(parcial)</span>}
@@ -535,29 +258,129 @@ export function ArbDashboard() {
                 </div>
               ))}
             </div>
-          </section>
+          </Panel>
 
-          <section className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-5">
-            <h2 className="text-lg font-semibold mb-1">Balances de wallets</h2>
-            <p className="text-xs text-neutral-500 mb-3">Total: {fmtUsd(totalUsd)} + {fmtNum(totalBtc, 3)} BTC</p>
-            <div className="space-y-2">
-              {Object.values(wallets).map((w) => (
-                <div key={w.exchange} className="flex items-center justify-between text-sm py-1 border-b border-neutral-800/40">
-                  <span className="w-24">{EXCHANGE_LABEL[w.exchange]}</span>
-                  <span className="font-mono text-neutral-300">{fmtUsd(w.usd)}</span>
-                  <span className="font-mono text-neutral-400">{fmtNum(w.btc, 4)} BTC</span>
-                </div>
-              ))}
+          <Panel title="Balances de wallets" subtitle={`${fmtUsd(totalUsd)} + ${fmtNum(totalBtc, 3)} BTC`}>
+            <div className="space-y-1">
+              {Object.values(e.wallets).map((w) => <WalletRow key={w.exchange} wallet={w} />)}
             </div>
-          </section>
+          </Panel>
         </div>
 
-        <p className="text-xs text-neutral-600 mt-6">
-          Simulación educativa / demo (no opera capital real). Net = bruto − fees taker − slippage (order book real)
-          − adverse selection por latencia − retiro amortizado. Feeds: WebSocket (Coinbase/Kraken/Bitstamp) + REST.
+        <p className="text-xs text-neutral-600 mt-8 max-w-3xl">
+          Simulación educativa / demo (no opera capital real). Net = bruto − fees − slippage (order book real) −
+          adverse selection por latencia − retiro amortizado. Feeds: WebSocket L2 (Kraken/Bitstamp/Bitfinex/Gemini) +
+          REST (Coinbase).
         </p>
       </div>
     </main>
+  );
+}
+
+/* ---------- Componentes presentacionales ---------- */
+
+function Panel({ title, subtitle, right, className = "", children }: {
+  title: string; subtitle?: string; right?: string; className?: string; children: React.ReactNode;
+}) {
+  return (
+    <section className={`rounded-xl border border-neutral-800 bg-neutral-900/50 p-5 ${className}`}>
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-lg font-semibold">
+          {title}
+          {subtitle && <span className="text-neutral-500 text-sm font-normal"> · {subtitle}</span>}
+        </h2>
+        {right && <span className="text-xs text-neutral-500 font-mono">{right}</span>}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function SectionHeader({ n, title, className = "" }: { n: string; title: string; className?: string }) {
+  return (
+    <div className={`flex items-center gap-3 mb-4 ${className}`}>
+      <span className="font-mono text-xs text-amber-400/70">{n}</span>
+      <h2 className="text-sm uppercase tracking-[0.25em] text-neutral-400">{title}</h2>
+      <span className="flex-1 h-px bg-neutral-800" />
+    </div>
+  );
+}
+
+function Toggle({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      onClick={onClick}
+      className={`px-2.5 py-1.5 rounded-full border text-sm transition-colors ${
+        active ? "border-amber-400 bg-amber-500/15 text-amber-200" : "border-neutral-700 text-neutral-300 hover:border-neutral-500"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function InfoTip({ children }: { children: React.ReactNode }) {
+  return (
+    <span className="group relative inline-flex">
+      <span tabIndex={0} className="mx-1 inline-grid h-3.5 w-3.5 place-items-center rounded-full border border-neutral-600 text-[9px] text-neutral-400 cursor-help">?</span>
+      <span role="tooltip" className="pointer-events-none absolute bottom-full left-1/2 z-30 mb-1 w-56 -translate-x-1/2 rounded-lg border border-neutral-700 bg-neutral-900 p-2 text-xs font-normal normal-case tracking-normal text-neutral-300 opacity-0 shadow-xl transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+        {children}
+      </span>
+    </span>
+  );
+}
+
+function BookRow({ book, status }: { book: OrderBook; status?: FeedStatus }) {
+  const bid = book.bids[0]?.price ?? 0;
+  const ask = book.asks[0]?.price ?? 0;
+  const bidFlash = useFlash(bid);
+  const askFlash = useFlash(ask);
+  const live = status === "live";
+  return (
+    <div className="flex items-center justify-between text-sm py-1.5 border-b border-neutral-800/50">
+      <span className="font-medium w-24 flex items-center gap-1.5">
+        {EXCHANGE_LABEL[book.exchange] ?? book.exchange}
+        <span className={`w-1.5 h-1.5 rounded-full ${live ? "bg-emerald-400 live-dot" : "bg-neutral-600"}`} title={live ? "WebSocket en vivo" : "REST"} />
+      </span>
+      {book.ok ? (
+        <>
+          <span className={`text-emerald-400 font-mono rounded px-1 ${bidFlash}`}>bid {fmtUsd(bid)}</span>
+          <span className={`text-rose-400 font-mono rounded px-1 ${askFlash}`}>ask {fmtUsd(ask)}</span>
+          <span className="text-neutral-500 text-xs w-16 text-right">{live ? "WS" : `${book.latencyMs}ms`}</span>
+        </>
+      ) : (
+        <span className="text-amber-500 text-xs">offline: {book.error}</span>
+      )}
+    </div>
+  );
+}
+
+function WalletRow({ wallet }: { wallet: Wallet }) {
+  return (
+    <div className="flex items-center justify-between text-sm py-1 border-b border-neutral-800/40">
+      <span className="w-24">{EXCHANGE_LABEL[wallet.exchange]}</span>
+      <span className="font-mono text-neutral-300">{fmtUsd(wallet.usd)}</span>
+      <span className="font-mono text-neutral-400">{fmtNum(wallet.btc, 4)} BTC</span>
+    </div>
+  );
+}
+
+function SkeletonRow() {
+  return (
+    <div className="flex items-center justify-between py-1.5 border-b border-neutral-800/50">
+      <div className="h-3 w-20 rounded bg-neutral-800 animate-pulse" />
+      <div className="h-3 w-24 rounded bg-neutral-800 animate-pulse" />
+      <div className="h-3 w-24 rounded bg-neutral-800 animate-pulse" />
+    </div>
+  );
+}
+
+function Cell({ label, value, highlight }: { label: string; value: string; highlight?: boolean }) {
+  return (
+    <div>
+      <p className="text-xs text-neutral-400">{label}</p>
+      <p className={`font-mono text-lg ${highlight ? "text-amber-400" : ""}`}>{value}</p>
+    </div>
   );
 }
 
@@ -570,24 +393,14 @@ function Stat({ label, value }: { label: string; value: string }) {
   );
 }
 
-function Metric({ label, value, good }: { label: string; value: string; good?: boolean }) {
+function Metric({ label, value, good, tip }: { label: string; value: string; good?: boolean; tip?: string }) {
   return (
     <div className="rounded-lg border border-neutral-800 bg-neutral-900/40 px-3 py-2">
       <div className="flex items-center justify-between">
-        <span className="text-xs text-neutral-400">{label}</span>
+        <span className="text-xs text-neutral-400 inline-flex items-center">{label}{tip && <InfoTip>{tip}</InfoTip>}</span>
         <span className={`w-1.5 h-1.5 rounded-full ${good ? "bg-emerald-400" : "bg-neutral-600"}`} />
       </div>
       <p className="font-mono text-base mt-0.5">{value}</p>
-    </div>
-  );
-}
-
-function Kpi({ label, value, sub, accent, big }: { label: string; value: string; sub?: string; accent?: boolean; big?: boolean }) {
-  return (
-    <div className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-4">
-      <p className="text-xs text-neutral-400 uppercase tracking-wide">{label}</p>
-      <p className={`font-semibold mt-1 ${big ? "text-2xl" : "text-lg"} ${accent === undefined ? "" : accent ? "text-emerald-400" : "text-rose-400"}`}>{value}</p>
-      {sub && <p className="text-xs text-neutral-500 mt-0.5">{sub}</p>}
     </div>
   );
 }

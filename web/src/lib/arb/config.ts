@@ -3,6 +3,16 @@
 export const EXCHANGES = ["coinbase", "kraken", "bitstamp", "gemini", "bitfinex"] as const;
 export type ExchangeId = (typeof EXCHANGES)[number];
 
+// --- Timing / ventanas (centralizado para que todos los tunables vivan aquí) ---
+export const POLL_MS = 1200; // bucle principal de detección
+export const TRIANGULAR_POLL_MS = 2500; // poll del arbitraje triangular
+export const L2_FRESHNESS_MS = 5000; // edad máxima para confiar en un libro L2
+export const WS_RECONNECT_MS = 3000; // backoff de reconexión de WebSocket
+export const DET_WINDOW = 100; // muestras para percentiles de latencia
+export const SPREAD_WINDOW = 120; // muestras para z-score del spread
+export const EQUITY_WINDOW = 150; // puntos en la curva de P&L
+export const TRADES_MAX = 60; // historial de trades en memoria
+
 export const TAKER_FEE: Record<string, number> = {
   coinbase: 0.006, // 0.60% Advanced Trade tier base (conservador)
   kraken: 0.0026, // 0.26%

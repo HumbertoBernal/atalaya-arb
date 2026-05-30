@@ -32,8 +32,6 @@ export type Opportunity = {
   viable: boolean; // netProfit > 0
 };
 
-export type Fill = { price: number; qty: number; cost: number };
-
 export type Trade = {
   id: string;
   ts: number;
