@@ -11,6 +11,21 @@ export const TAKER_FEE: Record<string, number> = {
   bitfinex: 0.002, // 0.20% taker
 };
 
+// Fees MAKER (órdenes límite): mucho menores que taker. Un retail que postea
+// límites paga esto — y por eso el arbitraje puede ser viable incluso en retail.
+// El costo: la orden puede NO ejecutarse antes de que el spread se cierre.
+export const MAKER_FEE: Record<string, number> = {
+  coinbase: 0.004, // 0.40% maker base
+  kraken: 0.0016, // 0.16%
+  bitstamp: 0.003, // 0.30%
+  gemini: 0.002, // 0.20%
+  bitfinex: 0.001, // 0.10% maker
+};
+
+// Probabilidad de que una orden límite (maker) se llene antes de que el spread
+// se cierre. Modela el riesgo de ejecución del modo maker.
+export const MAKER_FILL_PROB = 0.55;
+
 export const EXCHANGE_LABEL: Record<string, string> = {
   coinbase: "Coinbase",
   kraken: "Kraken",

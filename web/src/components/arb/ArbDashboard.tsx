@@ -9,7 +9,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { EXCHANGE_LABEL, EXCHANGES, INITIAL_BTC, INITIAL_USD, TAKER_FEE } from "@/lib/arb/config";
+import { EXCHANGE_LABEL, EXCHANGES, INITIAL_BTC, INITIAL_USD, MAKER_FEE, TAKER_FEE } from "@/lib/arb/config";
 import { detectOpportunities, simulateExecution } from "@/lib/arb/engine";
 import { LiveFeed, type FeedStatus } from "@/lib/arb/livefeed";
 import { evaluateRisk, sanitizeOpportunities, type RiskState } from "@/lib/arb/risk";
@@ -72,6 +72,7 @@ export function ArbDashboard() {
   const [equity, setEquity] = useState<{ t: number; pnl: number }[]>([]);
   const [running, setRunning] = useState(true);
   const [feeTier, setFeeTier] = useState<(typeof FEE_TIERS)[number]["id"]>("vip");
+  const [makerMode, setMakerMode] = useState(false);
   const [serverLatency, setServerLatency] = useState(0);
   const [tickCount, setTickCount] = useState(0);
   const [feedStatus, setFeedStatus] = useState<Record<string, FeedStatus>>({});
@@ -89,11 +90,13 @@ export function ArbDashboard() {
   const peakPnlRef = useRef(0);
   const runningRef = useRef(running);
   const feeRef = useRef(feeTier);
+  const makerRef = useRef(makerMode);
   const feedRef = useRef<LiveFeed | null>(null);
   walletsRef.current = wallets;
   pnlRef.current = pnl;
   runningRef.current = running;
   feeRef.current = feeTier;
+  makerRef.current = makerMode;
 
   // Arranca el feed WebSocket una vez.
   useEffect(() => {
@@ -129,8 +132,9 @@ export function ArbDashboard() {
     setFeedStatus(feedRef.current?.getStatus() ?? {});
     setTickCount((c) => c + 1);
 
+    const maker = makerRef.current;
     const t0 = performance.now();
-    const detectedRaw = detectOpportunities(map, mult);
+    const detectedRaw = detectOpportunities(map, mult, maker);
     const detMs = performance.now() - t0;
     const detected = sanitizeOpportunities(detectedRaw);
     setOpps(detected);
@@ -169,7 +173,7 @@ export function ArbDashboard() {
       const newTrades: Trade[] = [];
       let gained = 0;
       for (const opp of detected.filter((o) => o.viable)) {
-        const { trade, wallets: nextW } = simulateExecution(opp, map, w, mult);
+        const { trade, wallets: nextW } = simulateExecution(opp, map, w, mult, maker);
         if (trade) {
           w = nextW;
           newTrades.push(trade);
@@ -221,8 +225,8 @@ export function ArbDashboard() {
         const d = await res.json();
         if (!alive || !d.ok) return;
         const mult = FEE_TIERS.find((t) => t.id === feeRef.current)?.mult ?? 1;
-        const fee = (TAKER_FEE.coinbase ?? 0.006) * mult;
-        setTri({ results: detectTriangular(d.books as TriBooks, fee), ts: d.ts });
+        const base = makerRef.current ? (MAKER_FEE.coinbase ?? 0.004) : (TAKER_FEE.coinbase ?? 0.006);
+        setTri({ results: detectTriangular(d.books as TriBooks, base * mult), ts: d.ts });
       } catch {
         /* noop */
       }
@@ -313,8 +317,24 @@ export function ArbDashboard() {
               {t.label}
             </button>
           ))}
-          <span className="text-neutral-500 text-xs ml-1">
-            Con fees retail el arbitraje BTC/USD rara vez es neto-positivo (mercados eficientes); a fees HFT aparecen ejecuciones.
+          <span className="mx-2 text-neutral-700">|</span>
+          <span className="text-neutral-400">Ejecución:</span>
+          <button
+            onClick={() => setMakerMode(false)}
+            className={`px-2.5 py-1 rounded-full border ${!makerMode ? "border-indigo-400 bg-indigo-500/20 text-indigo-200" : "border-neutral-700 text-neutral-300 hover:border-neutral-500"}`}
+          >
+            Taker
+          </button>
+          <button
+            onClick={() => setMakerMode(true)}
+            className={`px-2.5 py-1 rounded-full border ${makerMode ? "border-indigo-400 bg-indigo-500/20 text-indigo-200" : "border-neutral-700 text-neutral-300 hover:border-neutral-500"}`}
+          >
+            Maker (límite)
+          </button>
+          <span className="text-neutral-500 text-xs ml-1 w-full md:w-auto">
+            {makerMode
+              ? "Maker: órdenes límite con fees menores (más viable en retail), pero solo se llenan ~55% de las veces — riesgo de ejecución modelado."
+              : "Taker: ejecución inmediata. Con fees retail el arbitraje BTC/USD rara vez es neto-positivo; a fees HFT o en modo Maker aparecen ejecuciones."}
           </span>
         </section>
 

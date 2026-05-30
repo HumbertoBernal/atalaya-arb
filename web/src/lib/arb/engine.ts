@@ -2,12 +2,16 @@
 // Funciones puras → testeables y deterministas.
 import {
   BTC_VOL_PER_SEC,
+  MAKER_FEE,
+  MAKER_FILL_PROB,
   MAX_TRADE_BTC,
   NETWORK_LATENCY_MS,
   REBALANCE_EVERY,
   TAKER_FEE,
   WITHDRAWAL_FEE_BTC,
 } from "./config";
+
+const feeTable = (maker: boolean) => (maker ? MAKER_FEE : TAKER_FEE);
 import type { Level, OrderBook, OrderBooks, Opportunity, Trade, Wallet } from "./types";
 
 const EPS = 1e-9;
@@ -94,7 +98,8 @@ export function optimalArb(
 
 /** Detecta todas las oportunidades viables entre pares de exchanges.
  *  feeMult escala los fees (1 = retail; <1 simula tiers VIP/HFT). */
-export function detectOpportunities(books: OrderBooks, feeMult = 1): Opportunity[] {
+export function detectOpportunities(books: OrderBooks, feeMult = 1, maker = false): Opportunity[] {
+  const fees = feeTable(maker);
   const ids = Object.keys(books).filter((id) => books[id].ok && books[id].asks.length && books[id].bids.length);
   const opps: Opportunity[] = [];
 
@@ -108,8 +113,8 @@ export function detectOpportunities(books: OrderBooks, feeMult = 1): Opportunity
       const grossSpread = sellBid - buyAsk;
       if (grossSpread <= 0) continue; // ni siquiera bruto
 
-      const buyFee = (TAKER_FEE[buyEx] ?? 0.005) * feeMult;
-      const sellFee = (TAKER_FEE[sellEx] ?? 0.005) * feeMult;
+      const buyFee = (fees[buyEx] ?? 0.005) * feeMult;
+      const sellFee = (fees[sellEx] ?? 0.005) * feeMult;
       const { qty, buyCost, sellProceeds } = optimalArb(
         buyBook.asks,
         sellBook.bids,
@@ -155,11 +160,13 @@ export function simulateExecution(
   books: OrderBooks,
   wallets: Record<string, Wallet>,
   feeMult = 1,
+  maker = false,
 ): { trade: Trade | null; wallets: Record<string, Wallet> } {
+  const fees = feeTable(maker);
   const buyW = wallets[opp.buyEx];
   const sellW = wallets[opp.sellEx];
-  const buyFee = (TAKER_FEE[opp.buyEx] ?? 0.005) * feeMult;
-  const sellFee = (TAKER_FEE[opp.sellEx] ?? 0.005) * feeMult;
+  const buyFee = (fees[opp.buyEx] ?? 0.005) * feeMult;
+  const sellFee = (fees[opp.sellEx] ?? 0.005) * feeMult;
 
   // Tope por liquidez (recalculado) y por saldos disponibles.
   const liq = optimalArb(books[opp.buyEx].asks, books[opp.sellEx].bids, buyFee, sellFee, MAX_TRADE_BTC);
@@ -172,6 +179,9 @@ export function simulateExecution(
   const maxByBtc = sellW.btc;
   const requested = qty;
   qty = Math.min(qty, maxByUsd, maxByBtc);
+  // Modo maker: la orden límite solo se llena con cierta probabilidad antes de
+  // que el spread se cierre → el volumen esperado ejecutado es menor.
+  if (maker) qty *= MAKER_FILL_PROB;
   if (qty <= EPS) return { trade: null, wallets };
 
   // Re-walk para la qty final (precios promedio reales con slippage).
