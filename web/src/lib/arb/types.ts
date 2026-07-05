@@ -46,6 +46,21 @@ export type Trade = {
   grossProfit: number; // USD
   netProfit: number; // USD (neto de fees)
   partial: boolean;
+  status: "filled" | "aborted"; // aborted = la re-verificación mató la orden
+  driftBps?: number; // cuánto se movió el neto entre detección y ejecución
+  abortReason?: string;
 };
 
 export type Wallet = { exchange: string; usd: number; btc: number };
+
+// Transferencia de rebalanceo entre venues (BTC viaja on-chain con delay).
+export type Transfer = {
+  id: string;
+  from: string;
+  to: string;
+  asset: "usd" | "btc";
+  amount: number; // lo que RECIBE el destino (el fee de red ya se quemó al salir)
+  feeBtc: number; // fee de red pagado (0 para USD)
+  sentTs: number;
+  arriveTs: number; // cuándo se acredita en el destino
+};

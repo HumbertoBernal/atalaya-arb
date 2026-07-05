@@ -155,6 +155,7 @@ export class L2Feed {
   private sockets = new Map<string, WebSocket>();
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
   private msgTimes = new Map<string, number[]>();
+  private attempts = new Map<string, number>(); // reintentos seguidos (para backoff)
   private closed = false;
 
   start() {
@@ -188,7 +189,10 @@ export class L2Feed {
         return;
       }
       const book = this.books.get(a.exchange);
-      if (book && a.apply(parsed, book) && book.ready) this.status.set(a.exchange, "live");
+      if (book && a.apply(parsed, book) && book.ready) {
+        this.status.set(a.exchange, "live");
+        this.attempts.set(a.exchange, 0); // conexión sana → backoff se reinicia
+      }
     };
     ws.onerror = () => ws.close();
     ws.onclose = () => {
@@ -198,11 +202,16 @@ export class L2Feed {
     };
   }
 
+  // Backoff exponencial con jitter (3s → 60s máx, ±20%), igual que LiveFeed.
   private reconnect(a: L2Adapter) {
     if (this.closed) return;
+    const n = this.attempts.get(a.exchange) ?? 0;
+    this.attempts.set(a.exchange, n + 1);
+    const base = Math.min(60_000, 3000 * 2 ** n);
+    const delay = base * (0.8 + Math.random() * 0.4);
     const prev = this.timers.get(a.exchange);
     if (prev) clearTimeout(prev);
-    this.timers.set(a.exchange, setTimeout(() => this.connect(a), 3000));
+    this.timers.set(a.exchange, setTimeout(() => this.connect(a), delay));
   }
 
   /** Libros L2 listos como OrderBook[] (solo los que tienen datos). */
