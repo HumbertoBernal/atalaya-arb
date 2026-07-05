@@ -139,21 +139,32 @@ export const PRESETS: { id: PresetId; label: string; hint: string; apply: (p: En
 
 /**
  * Merge profundo de un objeto parcial persistido sobre los defaults.
- * Tolerante a esquemas viejos: claves desconocidas se ignoran, faltantes
- * toman el default. Suficiente para nuestra forma (objetos planos anidados).
+ * Tolerante a esquemas viejos: claves desconocidas se descartan (venue
+ * eliminado, campo renombrado), tipos que no coinciden o números no finitos
+ * también, y las faltantes toman el default.
  */
 export function mergeParams(saved: unknown): EngineParams {
   const base = freshDefaults();
   if (!saved || typeof saved !== "object") return base;
   const s = saved as Record<string, unknown>;
   const out = base as unknown as Record<string, unknown>;
-  for (const key of Object.keys(base)) {
+
+  const validLeaf = (leaf: unknown, def: unknown) =>
+    typeof leaf === typeof def && (typeof leaf !== "number" || Number.isFinite(leaf));
+
+  for (const key of Object.keys(out)) {
     const val = s[key];
     if (val === undefined) continue;
     const def = out[key];
-    if (typeof def === "object" && def !== null && typeof val === "object" && val !== null) {
-      out[key] = { ...(def as object), ...(val as object) };
-    } else if (typeof val === typeof def) {
+    if (typeof def === "object" && def !== null) {
+      if (typeof val !== "object" || val === null) continue;
+      const defObj = def as Record<string, unknown>;
+      const merged: Record<string, unknown> = { ...defObj };
+      for (const [k, leaf] of Object.entries(val as Record<string, unknown>)) {
+        if (k in defObj && validLeaf(leaf, defObj[k])) merged[k] = leaf;
+      }
+      out[key] = merged;
+    } else if (validLeaf(val, def)) {
       out[key] = val;
     }
   }

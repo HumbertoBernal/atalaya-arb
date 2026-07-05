@@ -184,6 +184,31 @@ console.log("rebalance dirigido:");
     b: { exchange: "b", usd: 50000, btc: 2 },
   };
   check("sin déficit → 0 transferencias", planRebalance(sane, 50000, cfg, 0).transfers.length === 0);
+
+  // Regresión A1: capital ya en tránsito hacia un venue no se vuelve a enviar.
+  // `a` sigue agotado en saldos reales, pero los proyectados (real + en camino)
+  // ya lo sanean → el plan no debe duplicar la transferencia hacia `a`.
+  const enTransito: Record<string, Wallet> = {
+    a: { exchange: "a", usd: 1000, btc: 2 },
+    b: { exchange: "b", usd: 50000, btc: 2 },
+    c: { exchange: "c", usd: 48000, btc: 2 },
+  };
+  const proyectado: Record<string, Wallet> = {
+    ...enTransito,
+    a: { exchange: "a", usd: 34000, btc: 2 }, // 33k USD vienen en camino
+  };
+  const dupe = planRebalance(enTransito, 50000, cfg, 0, { projected: proyectado });
+  check("A1: no duplica envíos a venue con fondos en tránsito", dupe.transfers.length === 0);
+
+  // M4: un venue que no puede recibir (desactivado) dona pero no se fondea.
+  const conInactivo: Record<string, Wallet> = {
+    a: { exchange: "a", usd: 1000, btc: 2 },
+    b: { exchange: "b", usd: 99000, btc: 2 },
+  };
+  const sinReceptor = planRebalance(conInactivo, 50000, cfg, 0, { canReceive: (ex) => ex !== "a" });
+  check("M4: venue no-receptor no recibe transferencias", !sinReceptor.transfers.some((t) => t.to === "a"));
+  const normal = planRebalance(conInactivo, 50000, cfg, 0);
+  check("M4: sin restricción sí lo fondea", normal.transfers.some((t) => t.to === "a"));
 }
 
 console.log("simulateExecution:");

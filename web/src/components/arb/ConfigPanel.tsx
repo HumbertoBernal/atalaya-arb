@@ -320,6 +320,34 @@ function Group({ title, hint, children }: { title: string; hint?: string; childr
   );
 }
 
+/**
+ * Input numérico con estado BORRADOR: se puede teclear libremente ("2.", vacío,
+ * un valor a medias) y el valor se valida/clampa y comitea al salir del campo
+ * o con Enter. Un input controlado directo secuestraría el tipeo: el clamp de
+ * `min` corrompería valores a medio escribir y el re-render del tick (1.2s)
+ * pisaría el borrador.
+ */
+function useDraftNumber(value: number, onCommit: (v: number) => void, min?: number, max?: number) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const shown = draft ?? String(+value.toFixed(6));
+  const commit = () => {
+    if (draft === null) return;
+    const v = parseFloat(draft);
+    if (Number.isFinite(v)) {
+      let x = v;
+      if (min !== undefined) x = Math.max(min, x);
+      if (max !== undefined) x = Math.min(max, x);
+      onCommit(x);
+    }
+    setDraft(null); // descarta borradores inválidos y vuelve al valor vigente
+  };
+  return { shown, setDraft, commit };
+}
+
+const commitOnEnter = (ev: React.KeyboardEvent<HTMLInputElement>) => {
+  if (ev.key === "Enter") ev.currentTarget.blur();
+};
+
 function Num({
   label,
   value,
@@ -339,6 +367,7 @@ function Num({
   suffix?: string;
   tip?: string;
 }) {
+  const { shown, setDraft, commit } = useDraftNumber(value, onChange, min, max);
   return (
     <label className="block" title={tip}>
       <span className="block text-xs text-neutral-400 mb-1">
@@ -348,14 +377,13 @@ function Num({
       <span className="flex items-center gap-1.5">
         <input
           type="number"
-          value={Number.isFinite(value) ? +value.toFixed(6) : 0}
+          value={shown}
           step={step}
           min={min}
           max={max}
-          onChange={(ev) => {
-            const v = parseFloat(ev.target.value);
-            if (Number.isFinite(v)) onChange(min !== undefined ? Math.max(min, v) : v);
-          }}
+          onChange={(ev) => setDraft(ev.target.value)}
+          onBlur={commit}
+          onKeyDown={commitOnEnter}
           className="w-full rounded-md border border-neutral-700 bg-neutral-950 px-2 py-1.5 font-mono text-sm text-neutral-100 focus:border-cyan-500 focus:outline-none"
         />
         {suffix && <span className="text-xs text-neutral-500 whitespace-nowrap">{suffix}</span>}
@@ -365,16 +393,16 @@ function Num({
 }
 
 function MiniNum({ value, onChange, step }: { value: number; onChange: (v: number) => void; step: number }) {
+  const { shown, setDraft, commit } = useDraftNumber(value, onChange, 0);
   return (
     <input
       type="number"
-      value={+value.toFixed(6)}
+      value={shown}
       step={step}
       min={0}
-      onChange={(ev) => {
-        const v = parseFloat(ev.target.value);
-        if (Number.isFinite(v) && v >= 0) onChange(v);
-      }}
+      onChange={(ev) => setDraft(ev.target.value)}
+      onBlur={commit}
+      onKeyDown={commitOnEnter}
       className="w-24 rounded border border-neutral-800 bg-neutral-950 px-1.5 py-1 text-right font-mono text-xs text-neutral-200 focus:border-cyan-500 focus:outline-none"
     />
   );

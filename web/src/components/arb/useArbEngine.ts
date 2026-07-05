@@ -27,7 +27,7 @@ import {
   planRebalance,
   projectWallets,
 } from "@/lib/arb/rebalance";
-import { freshDefaults, mergeParams, PRESETS, type EngineParams, type PresetId } from "@/lib/arb/params";
+import { freshDefaults, isActive, mergeParams, PRESETS, type EngineParams, type PresetId } from "@/lib/arb/params";
 import { evaluateRisk, sanitizeOpportunities, type RiskState } from "@/lib/arb/risk";
 import { pushCapped, zScore, type ZScore } from "@/lib/arb/stats";
 import { detectTriangular, type TriBooks, type TriResult } from "@/lib/arb/triangular";
@@ -45,6 +45,8 @@ export type Metrics = { detP50: number; detP99: number; wsRate: number; freshnes
 export type SessionStats = {
   oppsSeen: number;
   viableSeen: number;
+  filledCount: number; // fills acumulados de la sesión (el ledger se capa a TRADES_MAX)
+  partialCount: number;
   volumeBtc: number;
   bestTrade: number;
   rebalances: number;
@@ -54,6 +56,8 @@ export type SessionStats = {
 const emptySession = (): SessionStats => ({
   oppsSeen: 0,
   viableSeen: 0,
+  filledCount: 0,
+  partialCount: 0,
   volumeBtc: 0,
   bestTrade: 0,
   rebalances: 0,
@@ -66,7 +70,7 @@ const emptySession = (): SessionStats => ({
 type PendingOrder = { opp: Opportunity; createdTs: number };
 
 const PARAMS_KEY = "atalaya.params.v1";
-const SESSION_KEY = "atalaya.session.v1";
+const SESSION_KEY = "atalaya.session.v2"; // v2: SessionStats con filledCount/partialCount
 const SESSION_MAX_AGE_MS = 24 * 3600_000;
 
 type SavedSession = {
@@ -171,8 +175,14 @@ export function useArbEngine() {
         if (raw) {
           const saved = JSON.parse(raw) as SavedSession;
           if (saved.savedAt && Date.now() - saved.savedAt < SESSION_MAX_AGE_MS) {
-            setWallets(saved.wallets);
-            walletsRef.current = saved.wallets;
+            // Merge sobre initWallets: si el snapshot viene de un esquema con
+            // otros venues, los faltantes arrancan con capital y los extra se caen.
+            const restoredW = initWallets(p);
+            for (const ex of EXCHANGES) {
+              if (saved.wallets?.[ex]) restoredW[ex] = saved.wallets[ex];
+            }
+            setWallets(restoredW);
+            walletsRef.current = restoredW;
             setPnl(saved.pnl);
             pnlRef.current = saved.pnl;
             peakPnlRef.current = saved.peakPnl ?? Math.max(0, saved.pnl);
@@ -232,11 +242,10 @@ export function useArbEngine() {
     };
   }, []);
 
-  const tick = useCallback(async () => {
-    const p = paramsRef.current;
-    const c = chaosRef.current;
-    const now = Date.now();
+  const busyRef = useRef(false); // guard de re-entrada: un fetch lento (>POLL_MS)
+  // solaparía ticks y sus setWallets se pisarían entre sí (P&L ≠ wallets).
 
+  const tickBody = useCallback(async () => {
     let payload: { books: OrderBook[]; serverLatencyMs: number };
     try {
       const res = await fetch("/api/orderbooks", { cache: "no-store" });
@@ -244,6 +253,12 @@ export function useArbEngine() {
     } catch {
       return;
     }
+
+    // Leer params/caos DESPUÉS del await: así el primer tick ya ve los valores
+    // restaurados de localStorage (el microtask corre durante el fetch).
+    const p = paramsRef.current;
+    const c = chaosRef.current;
+    const now = Date.now();
 
     // Combinar REST + L2 + tops de WS (L2 preferido cuando es válido).
     const fresh = mergeBooks(
@@ -320,6 +335,8 @@ export function useArbEngine() {
       const pend = pendingRef.current;
       pendingRef.current = [];
       for (const po of pend) {
+        // Venue desactivado con la orden en vuelo → se cancela sin ejecutar.
+        if (!isActive(p, po.opp.buyEx) || !isActive(p, po.opp.sellEx)) continue;
         const rc = recheckOpportunity(po.opp, map, p);
         if (rc.ok && rc.fresh) {
           const { trade, wallets: nextW } = simulateExecution(rc.fresh, map, w, p);
@@ -336,25 +353,32 @@ export function useArbEngine() {
         } else {
           newTrades.push(abortedTrade(po.opp, rc.reason ?? "condiciones cambiaron", rc.driftBps));
         }
+        // Cuenta por ORDEN abortada (un tick adverso con varias pendientes
+        // puede disparar el breaker de golpe — comportamiento deseado).
         abortsRef.current += 1;
         s.aborted += 1;
       }
 
       // FASE 1: lo viable detectado ahora entra como orden pendiente y se
       // ejecutará (o abortará) el próximo tick — la ventana de ejecución.
-      const inFlight = new Set<string>();
+      // (detectOpportunities produce cada par a lo sumo una vez.)
       for (const opp of detected.filter((o) => o.viable)) {
-        const key = `${opp.buyEx}>${opp.sellEx}`;
-        if (inFlight.has(key)) continue;
-        inFlight.add(key);
         pendingRef.current.push({ opp, createdTs: now });
       }
 
-      // Rebalanceo dirigido si algún venue se agotó y no viene nada en camino.
+      // Rebalanceo dirigido si algún venue ACTIVO se agotó y no viene nada en
+      // camino: déficits sobre saldos proyectados (real + en tránsito) para no
+      // duplicar envíos; venues desactivados donan pero no reciben.
       const projected = projectWallets(w, transfersRef.current);
+      const activeProjected = Object.fromEntries(
+        Object.entries(projected).filter(([ex]) => isActive(p, ex)),
+      );
       const refP = referencePrice(merged);
-      if (refP && needsRebalance(projected, p.rebalance)) {
-        const plan = planRebalance(w, refP, p.rebalance, now);
+      if (refP && needsRebalance(activeProjected, p.rebalance)) {
+        const plan = planRebalance(w, refP, p.rebalance, now, {
+          projected,
+          canReceive: (ex) => isActive(p, ex),
+        });
         if (plan.transfers.length) {
           w = debitTransfers(w, plan.transfers);
           transfersRef.current = [...transfersRef.current, ...plan.transfers];
@@ -375,18 +399,24 @@ export function useArbEngine() {
       setPnl(newPnl);
       pnlRef.current = newPnl;
       peakPnlRef.current = Math.max(peakPnlRef.current, newPnl);
+      const ordered = [...newTrades].reverse(); // fuera del updater (debe ser puro)
       setTrades((prev) => {
-        const next = [...newTrades.reverse(), ...prev].slice(0, TRADES_MAX);
+        const next = [...ordered, ...prev].slice(0, TRADES_MAX);
         tradesRef.current = next;
         return next;
       });
       for (const tr of newTrades) {
         if (tr.status !== "filled") continue;
+        s.filledCount += 1;
+        if (tr.partial) s.partialCount += 1;
         s.volumeBtc += tr.qty;
         s.bestTrade = Math.max(s.bestTrade, tr.netProfit);
       }
     }
-    if (walletsTouched) setWallets(w);
+    if (walletsTouched) {
+      setWallets(w);
+      walletsRef.current = w; // sync inmediato: no esperar al effect post-commit
+    }
 
     setTransfers([...transfersRef.current]);
     setPendingPairs(pendingRef.current.map((po) => `${po.opp.buyEx}>${po.opp.sellEx}`));
@@ -398,6 +428,16 @@ export function useArbEngine() {
       return next;
     });
   }, []);
+
+  const tick = useCallback(async () => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    try {
+      await tickBody();
+    } finally {
+      busyRef.current = false;
+    }
+  }, [tickBody]);
 
   // Bucle principal.
   useEffect(() => {
@@ -430,25 +470,27 @@ export function useArbEngine() {
   }, []);
 
   // --- Controles de parámetros (persisten en localStorage) ---
+  // paramsRef se actualiza sincrónico: llamadas consecutivas componen bien y
+  // el side effect (persistir) queda fuera del updater de React (debe ser puro).
   const patchParams = useCallback((patch: Partial<EngineParams>) => {
-    setParamsState((prev) => {
-      const next = { ...prev, ...patch };
-      persistParams(next);
-      return next;
-    });
+    const next = { ...paramsRef.current, ...patch };
+    paramsRef.current = next;
+    persistParams(next);
+    setParamsState(next);
   }, []);
 
   const applyPreset = useCallback((id: PresetId) => {
-    setParamsState((prev) => {
-      const preset = PRESETS.find((x) => x.id === id);
-      const next = preset ? preset.apply(prev) : prev;
-      persistParams(next);
-      return next;
-    });
+    const preset = PRESETS.find((x) => x.id === id);
+    if (!preset) return;
+    const next = preset.apply(paramsRef.current);
+    paramsRef.current = next;
+    persistParams(next);
+    setParamsState(next);
   }, []);
 
   const resetParams = useCallback(() => {
     const next = freshDefaults();
+    paramsRef.current = next;
     persistParams(next);
     setParamsState(next);
   }, []);

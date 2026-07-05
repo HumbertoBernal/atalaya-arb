@@ -35,7 +35,7 @@ export function DepthChart({ books }: { books: OrderBook[] }) {
   const usable = books.filter((b) => b.ok && b.bids.length > 2 && b.asks.length > 2);
   const [venue, setVenue] = useState<string | null>(null);
   const active = usable.find((b) => b.exchange === venue) ?? usable[0];
-  // buildDepth es barato (≤50 niveles); el React Compiler memoiza el render.
+  // buildDepth es barato (≤50 niveles) y `books` cambia cada tick: memoizar no ayuda.
   const data = active ? buildDepth(active) : [];
 
   if (!active) {

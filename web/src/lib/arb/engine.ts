@@ -14,6 +14,12 @@ const EPS = 1e-9;
  *   la latencia combinada de ambos exchanges.
  * - Withdrawal fee amortizado: el arbitraje pre-posicionado rebalancea cada
  *   N operaciones; el costo on-chain se reparte entre ellas.
+ *
+ * SESGO CONSERVADOR DELIBERADO: estos costos ex-ante se cobran en cada trade
+ * AUNQUE el sistema también pague los costos realizados — el fee de red real
+ * en cada rebalanceo (rebalance.ts) y la deriva real de precios vía la
+ * re-verificación de la fase 2 (recheckOpportunity). Preferimos doble colchón
+ * y un P&L subestimado antes que prometer rentabilidad que no existe.
  */
 export function frictionCosts(
   buyEx: string,

@@ -25,7 +25,7 @@ en bruto puede ser negativa tras **fees, slippage y liquidez** — y ahí está 
 | Motor cuant | **TypeScript puro** (funciones puras y testeables en `lib/arb/`) |
 | Tiempo real | **WebSocket** (order book L2 + top-of-book) + **REST** (fallback) |
 | Datos de mercado | APIs públicas de **Coinbase, Kraken, Bitstamp, Gemini, Bitfinex** (sin API keys) |
-| Testing | **tsx** + runner propio (`pnpm test`, 62 aserciones deterministas) |
+| Testing | **tsx** + runner propio (`pnpm test`, 65 aserciones deterministas) |
 | Tooling | **pnpm**, **ESLint**, **MathJax** (render de fórmulas) |
 | Deploy | **Vercel** (producción) · **GitHub** (repo) |
 
@@ -91,7 +91,7 @@ Cliente (React, ~1.2s + push WS) — todo recibe EngineParams (43 tunables runti
 - **Panel de métricas**: latencia de detección p50/p99, throughput WS (msgs/seg), frescura de datos.
 - **Sesión persistente**: P&L, ledger, wallets y transferencias sobreviven recargas (localStorage);
   el ledger se exporta a **CSV**.
-- **Tests**: `pnpm test` (62 aserciones del motor, deterministas).
+- **Tests**: `pnpm test` (65 aserciones del motor, deterministas).
 
 ### Decisiones técnicas clave
 
@@ -151,7 +151,7 @@ web/src/
     stats.ts       # z-score (arbitraje estadístico)
     config.ts      # defaults: exchanges, fees, withdrawal, latencia, riesgo
     types.ts
-scripts/test-engine.ts          # tests unitarios (pnpm test, 62 aserciones)
+scripts/test-engine.ts          # tests unitarios (pnpm test, 65 aserciones)
 scripts/test-arb.ts             # test de humo con order books reales
 ```
 
@@ -168,7 +168,7 @@ cd atalaya-arb/web
 pnpm install        # instala dependencias
 
 pnpm dev            # desarrollo → http://localhost:3000
-pnpm test           # tests unitarios del motor (62 aserciones)
+pnpm test           # tests unitarios del motor (65 aserciones)
 pnpm build          # build de producción
 pnpm start          # sirve el build de producción
 ```
@@ -190,7 +190,7 @@ No requiere variables de entorno ni API keys: todos los datos son de endpoints p
   real; sesión persistente y export CSV.
 - **Documentación y claridad:** este README, [DEMO.md](DEMO.md), la página
   [Cómo funciona](https://atalaya-arb.vercel.app/como-funciona.html) con la matemática completa, y un
-  motor de funciones puras con 62 aserciones de test.
+  motor de funciones puras con 65 aserciones de test.
 
 ## Limitaciones honestas
 
@@ -204,3 +204,6 @@ No requiere variables de entorno ni API keys: todos los datos son de endpoints p
   pre-posicionado entre venues — que es justo lo que simulamos, con rebalanceo automático.
 - Fees, withdrawal, latencia y probabilidad de fill son aproximados y públicos por exchange (todos
   editables en el panel de parámetros); no incluye descuentos personalizados.
+- **Sesgo conservador deliberado**: los costos de latencia y retiro se descuentan *ex-ante* en cada
+  trade **y además** el sistema paga los costos *realizados* (fee de red en cada rebalanceo, deriva
+  real de precios vía la re-verificación). Doble colchón a propósito: preferimos subestimar el P&L.

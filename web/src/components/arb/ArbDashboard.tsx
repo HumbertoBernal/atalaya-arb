@@ -72,9 +72,6 @@ export function ArbDashboard() {
   const viableCount = e.opps.filter((o) => o.viable).length;
   const totalUsd = Object.values(e.wallets).reduce((s, w) => s + w.usd, 0);
   const totalBtc = Object.values(e.wallets).reduce((s, w) => s + w.btc, 0);
-  const filled = e.trades.filter((t) => t.status === "filled");
-  const partialCount = filled.filter((t) => t.partial).length;
-  const abortedCount = e.trades.filter((t) => t.status === "aborted").length;
   const wsLive = Object.values(e.feedStatus).filter((s) => s === "live").length;
   const loading = e.books.length === 0;
   const activeTier = FEE_TIERS.find((t) => Math.abs(t.mult - e.params.feeMult) < 1e-9);
@@ -144,8 +141,8 @@ export function ArbDashboard() {
             </p>
             <div className="mt-3 flex flex-wrap gap-x-6 gap-y-1 text-xs text-neutral-500">
               <span>
-                <span className="text-neutral-300 font-mono">{filled.length}</span> operaciones · {partialCount} parciales ·{" "}
-                <span className="text-amber-400/90 font-mono">{abortedCount}</span> abortadas
+                <span className="text-neutral-300 font-mono">{e.session.filledCount}</span> operaciones · {e.session.partialCount} parciales ·{" "}
+                <span className="text-amber-400/90 font-mono">{e.session.aborted}</span> abortadas
               </span>
               <span><span className="text-neutral-300 font-mono">{fmtNum(totalBtc, 2)}</span> BTC inventario</span>
               <span className="capitalize">
@@ -310,7 +307,7 @@ export function ArbDashboard() {
               <Stat label="Tiempo activo" value={e.nowTs && e.session.startTs ? fmtDuration(e.nowTs - e.session.startTs) : "—"} />
               <Stat label="Oportunidades vistas" value={e.session.oppsSeen.toLocaleString()} />
               <Stat label="Viables detectadas" value={e.session.viableSeen.toLocaleString()} />
-              <Stat label="Capture rate" value={e.session.viableSeen ? `${((filled.length / e.session.viableSeen) * 100).toFixed(0)}%` : "—"} />
+              <Stat label="Capture rate" value={e.session.viableSeen ? `${((e.session.filledCount / e.session.viableSeen) * 100).toFixed(0)}%` : "—"} />
               <Stat label="Volumen operado" value={`${fmtNum(e.session.volumeBtc, 3)} BTC`} />
               <Stat label="Mejor operación" value={fmtUsd(e.session.bestTrade)} />
               <Stat label="Abortadas (re-check)" value={`${e.session.aborted}`} />
@@ -340,8 +337,7 @@ export function ArbDashboard() {
         <div className="grid lg:grid-cols-2 gap-6">
           <Panel
             title="Operaciones"
-            subtitle="fills, parciales y abortos"
-            right={e.trades.length ? undefined : ""}
+            subtitle="fills, parciales y abortos · últimas 60"
             action={
               e.trades.length > 0 ? (
                 <button

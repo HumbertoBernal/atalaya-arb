@@ -56,7 +56,7 @@ Abre la URL. Señala que ya está corriendo en vivo (no es un video). Si aparece
 - **Export CSV** del ledger para auditar las operaciones.
 
 ## 6 · Cierre — código y honestidad (5s) · *criterio: documentación y claridad*
-> "Todo es TypeScript tipado, con el motor en funciones puras — `pnpm test`, 62 aserciones.
+> "Todo es TypeScript tipado, con el motor en funciones puras — `pnpm test`, 65 aserciones.
 > Y lo más importante: es **honesto**. No promete alpha que no existe; demuestra exactamente
 > dónde y por qué el arbitraje funciona, y qué lo mata."
 
