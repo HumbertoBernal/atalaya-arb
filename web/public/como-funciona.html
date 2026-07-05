@@ -62,14 +62,17 @@
   <div class="panel"><div class="mono" style="font-size:0.82rem;white-space:pre;overflow-x:auto;color:var(--muted)">5 exchanges (Coinbase, Kraken, Bitstamp, Gemini, Bitfinex)
    │  WebSocket L2 (libro completo, 4 venues)   │  REST (Coinbase + fallback)
    ▼                                            ▼
-LiveFeed + L2Feed (cliente) ──► merge (L2 depth / REST) ──► motor
-   ├─ detectOpportunities()   cross-exchange, ranking por neto
+LiveFeed + L2Feed (cliente) ──► merge (L2 depth / REST) ──► applyChaos() ──► motor
+                                                            (escenarios adversos, demo)
+Todo el motor recibe EngineParams — 43 parámetros ajustables en runtime
+   ├─ detectOpportunities()   cross-exchange, umbral en bps, ranking por neto
    ├─ optimalArb()            tamaño óptimo por profitabilidad marginal
    ├─ frictionCosts()         latencia (adverse selection) + retiro amortizado
-   ├─ evaluateRisk()          circuit breaker
-   ├─ detectTriangular()      ciclos USD→BTC→ETH→USD
-   ├─ rebalance()             repone inventario agotado
-   └─ simulateExecution()     fills parciales + balances + P&L</div></div>
+   ├─ evaluateRisk()          circuit breaker (stale/anómalo/drawdown/abortos)
+   ├─ FASE 1 → orden pendiente; FASE 2 → recheckOpportunity() contra libro fresco
+   ├─ simulateExecution()     fills parciales + balances + P&L
+   ├─ planRebalance()         transferencias dirigidas con fee de red y delay
+   └─ detectTriangular()      ciclos USD→BTC→ETH→USD</div></div>
 
   <h2>3 · La matemática</h2>
 
@@ -102,13 +105,26 @@ LiveFeed + L2Feed (cliente) ──► merge (L2 depth / REST) ──► motor
     — la vía de un retail listo. El costo: solo se llenan con probabilidad \(p\) antes de que el spread
     se cierre, así que el volumen esperado es \(Q_{\text{exe}} = p\cdot Q^\star\) (riesgo de ejecución).</p>
 
-  <h3>3.6 Balances y rebalanceo</h3>
-  <p>Cada arbitraje compra y vende la misma cantidad de BTC → el inventario total de BTC es constante y
-    la ganancia queda en USD. Cuando un venue agota su USD o BTC, su ruta muere; el <strong>rebalanceo</strong>
-    redistribuye el inventario pagando el fee de red. El P&amp;L realizado es:</p>
-  <div class="formula">$$ \text{P\&L} = \sum_k \Pi_k - \text{costos de rebalanceo} $$</div>
+  <h3>3.6 Ejecución en dos fases: la re-verificación</h3>
+  <p>Detectar y ejecutar sobre el <em>mismo</em> snapshot sería hacer trampa: en la realidad el mercado
+    se mueve durante la ventana de ejecución. Por eso cada orden viable queda <strong>pendiente</strong>
+    un tick y se re-verifica contra el libro fresco antes de llenarse. Si \(\pi^{\text{fresco}}\) es el
+    neto recalculado, la orden se <strong class="rose">aborta</strong> cuando:</p>
+  <div class="formula">$$ \pi^{\text{fresco}} \le 0 \quad\text{o}\quad
+    \underbrace{\text{bps}(\pi^{\text{esperado}}) - \text{bps}(\pi^{\text{fresco}})}_{\text{deriva}} > \tau $$</div>
+  <p>donde \(\tau\) es la <strong>tolerancia de deriva</strong> (configurable). Los abortos quedan en el
+    ledger con su motivo y deriva; \(N\) abortos consecutivos disparan el circuit breaker — si el mercado
+    es más rápido que nuestra ejecución, lo correcto es <em>dejar de perseguirlo</em>.</p>
 
-  <h3>3.7 Arbitraje triangular y estadístico</h3>
+  <h3>3.7 Balances y rebalanceo dirigido</h3>
+  <p>Cada arbitraje compra y vende la misma cantidad de BTC → el inventario total de BTC es constante y
+    la ganancia queda en USD. Cuando un venue agota su USD o BTC, su ruta muere; el <strong>rebalanceo
+    dirigido</strong> transfiere del venue más sobrado al deficitario (no un reset parejo): el BTC paga
+    fee de red \(\phi_{\text{red}}\) y <strong>tarda en confirmar</strong> — mientras viaja, ese capital
+    no está disponible para operar. El P&amp;L realizado es:</p>
+  <div class="formula">$$ \text{P\&L} = \sum_k \Pi_k - \sum_j \phi_{\text{red},j}\cdot P_{\text{BTC}} $$</div>
+
+  <h3>3.8 Arbitraje triangular y estadístico</h3>
   <p><strong>Triangular</strong>: ciclo intra-exchange \(\text{USD}\to\text{BTC}\to\text{ETH}\to\text{USD}\);
     hay arbitraje si el producto de las conversiones (neto de fee) supera 1.
     <strong>Estadístico</strong>: z-score del spread vs su media móvil — \(|z|\) alto señala un spread inusual
@@ -120,7 +136,21 @@ LiveFeed + L2Feed (cliente) ──► merge (L2 depth / REST) ──► motor
   <p class="muted">Ahí el spread bruto era 36 bps, enorme. En BTC/USD entre majors es 1–3 bps y rara vez
     sobrevive a fees retail.</p>
 
-  <h2>5 · Honestidad: por qué NO usamos ML</h2>
+  <h2>5 · Parametrización: el motor como función de sus supuestos</h2>
+  <div class="panel">
+    <p style="margin-top:0">El motor son funciones puras que reciben <code>EngineParams</code> —
+      <strong>43 parámetros ajustables en runtime</strong> desde el panel de la UI, sin recargar:
+      umbral mínimo en bps, tamaño máximo por orden, exchanges activos, fees taker/maker por venue,
+      latencia y withdrawal por venue, tolerancia de deriva, límites del circuit breaker, política de
+      rebalanceo (mínimos, fee de red, delay de confirmación) y capital inicial.</p>
+    <p style="margin-bottom:0">Esto convierte cada supuesto del modelo en una <strong>hipótesis
+      explorable</strong>: ¿a qué fee muere el arbitraje? ¿cuánta tolerancia de deriva aguanta la
+      estrategia? ¿qué pasa con 2 venues en vez de 5? El jurado puede responderlas en vivo.
+      Además hay un <strong>modo caos</strong> que inyecta escenarios adversos (venue caído, shock de
+      precio, sequía de liquidez, feeds congelados) para ver reaccionar las defensas.</p>
+  </div>
+
+  <h2>6 · Honestidad: por qué NO usamos ML</h2>
   <div class="panel">
     <p style="margin-top:0">Probamos un predictor online (regresión logística) para anticipar si una oportunidad
       persistiría. Medimos su rendimiento con rigor: la <strong>balanced accuracy fue ~50%</strong> (= azar),
@@ -130,7 +160,7 @@ LiveFeed + L2Feed (cliente) ──► merge (L2 depth / REST) ──► motor
       <em>no</em> usar ML, con evidencia en mano, es parte del dominio técnico.</p>
   </div>
 
-  <h2>6 · El hallazgo central</h2>
+  <h2>7 · El hallazgo central</h2>
   <div class="panel">
     <p style="margin:0">Con fees retail, el arbitraje BTC/USD entre majors es <strong class="rose">estructuralmente
       no rentable</strong> (mercados eficientes). El bot lo detecta y <strong>correctamente no opera</strong>.
