@@ -1,10 +1,8 @@
-// Feed en tiempo real vía WebSocket (lado cliente).
-// Mantiene el mejor bid/ask por exchange a partir de los feeds públicos, con
-// reconexión automática. El dashboard usa esto para detección sub-segundo y
-// medición de latencia; la profundidad para sizing sigue viniendo del REST.
-//
-// Coinbase, Kraken y Bitstamp por WS. Gemini permanece en REST (su feed L2
-// requiere mantener el libro completo; se prioriza robustez de la demo).
+// Feed en tiempo real vía WebSocket (lado cliente): TOP-OF-BOOK (ticker).
+// Mantiene el mejor bid/ask por exchange con reconexión automática (backoff
+// exponencial + jitter). Complementa a L2Feed (l2book.ts), que mantiene el
+// libro COMPLETO por WS para Bitstamp/Kraken/Bitfinex/Gemini; Coinbase queda
+// en ticker WS + REST porque su canal level2 exige autenticación.
 
 export type Top = { bid: number; ask: number; ts: number };
 export type FeedStatus = "connecting" | "live" | "closed";
@@ -71,6 +69,7 @@ export class LiveFeed {
   private status = new Map<string, FeedStatus>();
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
   private msgTimes = new Map<string, number[]>(); // timestamps recientes por exchange
+  private attempts = new Map<string, number>(); // reintentos seguidos (para backoff)
   private closed = false;
 
   start() {
@@ -106,6 +105,7 @@ export class LiveFeed {
       if (parsed && parsed.bid > 0 && parsed.ask > 0) {
         this.tops.set(a.exchange, { ...parsed, ts: Date.now() });
         this.status.set(a.exchange, "live");
+        this.attempts.set(a.exchange, 0); // conexión sana → backoff se reinicia
       }
     };
     ws.onerror = () => ws.close();
@@ -115,13 +115,19 @@ export class LiveFeed {
     };
   }
 
+  // Backoff exponencial con jitter: 3s, 6s, 12s… hasta 60s, ±20% aleatorio.
+  // Evita martillar un venue caído y que todos los clientes reintenten en fase.
   private scheduleReconnect(a: Adapter) {
     if (this.closed) return;
+    const n = this.attempts.get(a.exchange) ?? 0;
+    this.attempts.set(a.exchange, n + 1);
+    const base = Math.min(60_000, 3000 * 2 ** n);
+    const delay = base * (0.8 + Math.random() * 0.4);
     const prev = this.timers.get(a.exchange);
     if (prev) clearTimeout(prev);
     this.timers.set(
       a.exchange,
-      setTimeout(() => this.connect(a), 3000),
+      setTimeout(() => this.connect(a), delay),
     );
   }
 

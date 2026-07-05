@@ -1,10 +1,27 @@
 // Tests unitarios del motor (sin dependencias externas, deterministas).
 // Ejecutar: pnpm dlx tsx scripts/test-engine.ts
-import { optimalArb, detectOpportunities, simulateExecution } from "../src/lib/arb/engine";
+import {
+  abortedTrade,
+  detectOpportunities,
+  evalPair,
+  optimalArb,
+  recheckOpportunity,
+  simulateExecution,
+  totalEquity,
+} from "../src/lib/arb/engine";
 import { detectTriangular } from "../src/lib/arb/triangular";
 import { overlayWs, isL2Valid, referencePrice, percentile } from "../src/lib/arb/mergeBooks";
 import { zScore, pushCapped } from "../src/lib/arb/stats";
-import { rebalance, needsRebalance } from "../src/lib/arb/rebalance";
+import {
+  creditTransfer,
+  debitTransfers,
+  needsRebalance,
+  planRebalance,
+  projectWallets,
+} from "../src/lib/arb/rebalance";
+import { applyChaos, chaosActive, NO_CHAOS } from "../src/lib/arb/chaos";
+import { evaluateRisk } from "../src/lib/arb/risk";
+import { freshDefaults, type EngineParams } from "../src/lib/arb/params";
 import type { OrderBook, OrderBooks, Wallet } from "../src/lib/arb/types";
 
 let pass = 0;
@@ -19,6 +36,14 @@ function check(name: string, cond: boolean) {
   }
 }
 const approx = (a: number, b: number, t = 1e-6) => Math.abs(a - b) < t;
+
+// Params de test: sin fees (feeMult 0) y sin umbral, igual que la suite previa.
+const P = (over: Partial<EngineParams> = {}): EngineParams => ({
+  ...freshDefaults(),
+  feeMult: 0,
+  minNetBps: 0,
+  ...over,
+});
 
 console.log("optimalArb:");
 // Sin spread: comprar a 100, vender a 100 → 0 volumen.
@@ -51,17 +76,43 @@ console.log("optimalArb:");
   check("fees > spread → no ejecuta", approx(r.qty, 0));
 }
 
+const book = (ex: string, bid: number, ask: number, ts = Date.now()): OrderBook => ({
+  exchange: ex, bids: [{ price: bid, qty: 5 }], asks: [{ price: ask, qty: 5 }], ts, latencyMs: 0, ok: true,
+});
+
 console.log("detectOpportunities:");
 {
   const books: OrderBooks = {
-    a: { exchange: "a", bids: [{ price: 99, qty: 5 }], asks: [{ price: 100, qty: 5 }], ts: Date.now(), latencyMs: 0, ok: true },
-    b: { exchange: "b", bids: [{ price: 105, qty: 5 }], asks: [{ price: 106, qty: 5 }], ts: Date.now(), latencyMs: 0, ok: true },
+    a: book("a", 99, 100),
+    b: book("b", 105, 106),
   };
-  const opps = detectOpportunities(books, 0);
+  const opps = detectOpportunities(books, P());
   const best = opps[0];
   check("detecta comprar en a, vender en b", best.buyEx === "a" && best.sellEx === "b");
   check("ranking por neto (descendente)", opps.every((o, i) => i === 0 || opps[i - 1].netProfit >= o.netProfit));
   check("oportunidad inversa no viable (b→a)", !opps.find((o) => o.buyEx === "b" && o.sellEx === "a")?.viable);
+}
+
+console.log("parametrización:");
+{
+  const books: OrderBooks = { a: book("a", 99, 100), b: book("b", 105, 106) };
+  // Umbral en bps: el spread a→b es ~500 bps neto (sin fees). Umbral mayor lo descarta.
+  const low = detectOpportunities(books, P({ minNetBps: 100 }));
+  check("umbral 100 bps: sigue viable", low.find((o) => o.buyEx === "a")!.viable);
+  const high = detectOpportunities(books, P({ minNetBps: 2000 }));
+  check("umbral 2000 bps: deja de ser viable", !high.find((o) => o.buyEx === "a")?.viable);
+  // Exchange desactivado: desaparece del universo de detección.
+  const off = detectOpportunities(books, P({ activeExchanges: { a: true, b: false } }));
+  check("venue desactivado no participa", off.length === 0);
+  // maxTradeBtc configurable limita el volumen detectado.
+  const small = detectOpportunities(books, P({ maxTradeBtc: 0.3 }));
+  check("maxTradeBtc=0.3 limita qty", approx(small[0].maxQty, 0.3));
+  // Fees editables por venue: un fee altísimo mata la viabilidad.
+  const fat = detectOpportunities(
+    books,
+    P({ feeMult: 1, takerFee: { a: 0.05, b: 0.05 } }),
+  );
+  check("fee editado 5%+5% mata el neto", !fat.find((o) => o.buyEx === "a")?.viable);
 }
 
 console.log("detectTriangular:");
@@ -75,10 +126,6 @@ console.log("detectTriangular:");
   const withFee = detectTriangular(books, 0.01);
   check("fees altos → ninguna viable", withFee.every((r) => !r.viable));
 }
-
-const book = (ex: string, bid: number, ask: number, ts = Date.now()): OrderBook => ({
-  exchange: ex, bids: [{ price: bid, qty: 5 }], asks: [{ price: ask, qty: 5 }], ts, latencyMs: 0, ok: true,
-});
 
 console.log("mergeBooks / helpers:");
 {
@@ -105,19 +152,38 @@ console.log("stats:");
   check("pushCapped descarta el más viejo", pushCapped([1, 2, 3], 4, 3)[0] === 2);
 }
 
-console.log("rebalance:");
+console.log("rebalance dirigido:");
 {
+  const cfg = { minUsd: 5000, minBtc: 0.1, btcNetworkFee: 0.0003, transferDelaySec: 0 };
   const wallets: Record<string, Wallet> = {
     a: { exchange: "a", usd: 0, btc: 4 },
     b: { exchange: "b", usd: 100000, btc: 0 },
   };
-  check("needsRebalance detecta agotamiento", needsRebalance(wallets));
-  const { wallets: next, costUsd } = rebalance(wallets, 50000);
-  const totalBtcBefore = 4;
-  const totalBtcAfter = Object.values(next).reduce((s, w) => s + w.btc, 0);
-  check("rebalance conserva BTC (menos fee)", totalBtcAfter < totalBtcBefore && totalBtcAfter > totalBtcBefore - 0.01);
-  check("rebalance reparte USD parejo", Math.abs(next.a.usd - next.b.usd) < 1e-6);
-  check("rebalance tiene costo > 0", costUsd > 0);
+  check("needsRebalance detecta agotamiento", needsRebalance(wallets, cfg));
+  const { transfers, costUsd } = planRebalance(wallets, 50000, cfg, 1000);
+  check("planifica 2 transferencias dirigidas (usd b→a, btc a→b)", transfers.length === 2);
+  const usdT = transfers.find((t) => t.asset === "usd")!;
+  const btcT = transfers.find((t) => t.asset === "btc")!;
+  check("USD viaja del sobrado al agotado", usdT.from === "b" && usdT.to === "a");
+  check("BTC viaja del sobrado al agotado", btcT.from === "a" && btcT.to === "b");
+  check("costo = fee de red valuado", approx(costUsd, 0.0003 * 50000));
+
+  // Liquidación completa: débito inmediato + crédito al confirmar.
+  let w = debitTransfers(wallets, transfers);
+  check("débito inmediato: el BTC sale del origen", w.a.btc < 4);
+  const inTransit = projectWallets(w, transfers);
+  check("proyección con fondos en tránsito ya no dispara rebalanceo", !needsRebalance(inTransit, cfg));
+  for (const t of transfers) w = creditTransfer(w, t);
+  const totalBtc = Object.values(w).reduce((s, x) => s + x.btc, 0);
+  check("BTC total se conserva menos el fee de red", approx(totalBtc, 4 - 0.0003));
+  check("ambos venues quedan sobre el mínimo", !needsRebalance(w, cfg));
+
+  // Sin déficit no se planifica nada.
+  const sane: Record<string, Wallet> = {
+    a: { exchange: "a", usd: 50000, btc: 2 },
+    b: { exchange: "b", usd: 50000, btc: 2 },
+  };
+  check("sin déficit → 0 transferencias", planRebalance(sane, 50000, cfg, 0).transfers.length === 0);
 }
 
 console.log("simulateExecution:");
@@ -127,10 +193,11 @@ console.log("simulateExecution:");
     a: { exchange: "a", usd: 100000, btc: 5 },
     b: { exchange: "b", usd: 100000, btc: 5 },
   };
-  const opps = detectOpportunities(books, 0);
+  const opps = detectOpportunities(books, P());
   const viable = opps.find((o) => o.viable)!;
-  const { trade, wallets: next } = simulateExecution(viable, books, wallets, 0);
+  const { trade, wallets: next } = simulateExecution(viable, books, wallets, P());
   check("simulateExecution genera trade neto-positivo", !!trade && trade.netProfit > 0);
+  check("trade lleva status filled", trade?.status === "filled");
   if (trade) {
     const btcBefore = 10;
     const btcAfter = next.a.btc + next.b.btc;
@@ -139,7 +206,80 @@ console.log("simulateExecution:");
   }
   // Sin saldo BTC en el venue de venta → no ejecuta.
   const noBtc = { a: wallets.a, b: { exchange: "b", usd: 100000, btc: 0 } };
-  check("sin BTC en sellEx → no ejecuta", simulateExecution(viable, books, noBtc, 0).trade === null);
+  check("sin BTC en sellEx → no ejecuta", simulateExecution(viable, books, noBtc, P()).trade === null);
+  // Modo maker: el fill esperado se escala por la probabilidad configurada.
+  const taker = simulateExecution(viable, books, wallets, P()).trade!;
+  const maker = simulateExecution(viable, books, wallets, P({ maker: true, makerFillProb: 0.5 })).trade!;
+  check("maker fill prob 0.5 → mitad del volumen", approx(maker.qty, taker.qty * 0.5, 1e-6));
+}
+
+console.log("re-verificación (dos fases):");
+{
+  const books: OrderBooks = { a: book("a", 99, 100), b: book("b", 110, 111) };
+  const expected = evalPair("a", "b", books, P())!;
+  // Mercado quieto → la orden pasa.
+  const still = recheckOpportunity(expected, books, P());
+  check("sin deriva → ok", still.ok && approx(still.driftBps, 0, 0.01));
+  // El spread se cerró por completo → aborta.
+  const closed: OrderBooks = { a: book("a", 99, 100), b: book("b", 99, 100) };
+  const dead = recheckOpportunity(expected, closed, P());
+  check("spread cerrado → aborta", !dead.ok);
+  // Deriva moderada: neto cae ~10 bps. Tolerancia 5 → aborta; 50 → pasa.
+  const drifted: OrderBooks = { a: book("a", 99, 100), b: book("b", 109.9, 111) };
+  const tight = recheckOpportunity(expected, drifted, P({ recheckTolBps: 5 }));
+  check("deriva > tolerancia → aborta", !tight.ok && tight.driftBps > 5);
+  const loose = recheckOpportunity(expected, drifted, P({ recheckTolBps: 50 }));
+  check("deriva < tolerancia → ejecuta", loose.ok);
+  // La entrada de ledger del aborto es neutra en P&L.
+  const ab = abortedTrade(expected, "test", 10);
+  check("abortedTrade: qty 0 y neto 0", ab.qty === 0 && ab.netProfit === 0 && ab.status === "aborted");
+}
+
+console.log("modo caos:");
+{
+  const books = [book("a", 99, 100), book("b", 110, 111)];
+  check("NO_CHAOS no está activo", !chaosActive(NO_CHAOS, Date.now()));
+  const dead = applyChaos(books, { ...NO_CHAOS, offline: { a: true } }, Date.now());
+  check("venue caído queda offline", !dead.map.a.ok && dead.map.b.ok);
+  const dry = applyChaos(books, { ...NO_CHAOS, liquidityCrunch: true }, Date.now());
+  check("sequía reduce la liquidez visible", dry.map.a.bids[0].qty < books[0].bids[0].qty * 0.05);
+  const now = Date.now();
+  const shocked = applyChaos(
+    books,
+    { ...NO_CHAOS, shockVenue: "b", shockBps: -200, shockUntil: now + 10_000 },
+    now,
+  );
+  check("shock mueve el precio del venue", shocked.map.b.bids[0].price < books[1].bids[0].price);
+  check("el shock no toca otros venues", shocked.map.a.bids[0].price === books[0].bids[0].price);
+  const expired = applyChaos(
+    books,
+    { ...NO_CHAOS, shockVenue: "b", shockBps: -200, shockUntil: now - 1 },
+    now,
+  );
+  check("shock expirado no altera nada", expired.map.b.bids[0].price === books[1].bids[0].price);
+}
+
+console.log("circuit breaker:");
+{
+  const fresh = [book("a", 99, 100)];
+  const cfg = { maxBookAgeMs: 6000, maxGrossBps: 150, maxConsecutiveLosses: 3, maxDrawdownUsd: 5000 };
+  const okState = evaluateRisk(fresh, [], 0, 0, Date.now(), cfg, 0);
+  check("mercado sano → breaker en reposo", !okState.tripped);
+  const aborts = evaluateRisk(fresh, [], 0, 0, Date.now(), cfg, 3);
+  check("3 abortos seguidos → breaker dispara", aborts.tripped);
+  const dd = evaluateRisk(fresh, [], -6000, 0, Date.now(), cfg, 0);
+  check("drawdown sobre el límite → breaker dispara", dd.tripped);
+  const stale = evaluateRisk([book("a", 99, 100, Date.now() - 10_000)], [], 0, 0, Date.now(), cfg, 0);
+  check("datos stale → breaker dispara", stale.tripped);
+}
+
+console.log("equity:");
+{
+  const w: Record<string, Wallet> = {
+    a: { exchange: "a", usd: 1000, btc: 1 },
+    b: { exchange: "b", usd: 500, btc: 0.5 },
+  };
+  check("totalEquity valúa BTC al precio de referencia", approx(totalEquity(w, 1000), 3000));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

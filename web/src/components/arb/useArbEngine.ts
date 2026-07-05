@@ -4,24 +4,34 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   DET_WINDOW,
   EQUITY_WINDOW,
-  MAKER_FEE,
+  EXCHANGES,
   POLL_MS,
   SPREAD_WINDOW,
-  TAKER_FEE,
   TRADES_MAX,
   TRIANGULAR_POLL_MS,
-  INITIAL_BTC,
-  INITIAL_USD,
 } from "@/lib/arb/config";
-import { detectOpportunities, simulateExecution } from "@/lib/arb/engine";
+import {
+  abortedTrade,
+  detectOpportunities,
+  recheckOpportunity,
+  simulateExecution,
+} from "@/lib/arb/engine";
 import { mergeBooks, percentile, referencePrice } from "@/lib/arb/mergeBooks";
 import { LiveFeed, type FeedStatus } from "@/lib/arb/livefeed";
 import { L2Feed } from "@/lib/arb/l2book";
-import { needsRebalance, rebalance } from "@/lib/arb/rebalance";
+import { applyChaos, chaosActive, NO_CHAOS, type ChaosState } from "@/lib/arb/chaos";
+import {
+  creditTransfer,
+  debitTransfers,
+  needsRebalance,
+  planRebalance,
+  projectWallets,
+} from "@/lib/arb/rebalance";
+import { freshDefaults, mergeParams, PRESETS, type EngineParams, type PresetId } from "@/lib/arb/params";
 import { evaluateRisk, sanitizeOpportunities, type RiskState } from "@/lib/arb/risk";
 import { pushCapped, zScore, type ZScore } from "@/lib/arb/stats";
 import { detectTriangular, type TriBooks, type TriResult } from "@/lib/arb/triangular";
-import type { OrderBook, Opportunity, Trade, Wallet } from "@/lib/arb/types";
+import type { OrderBook, Opportunity, Trade, Transfer, Wallet } from "@/lib/arb/types";
 
 export const FEE_TIERS = [
   { id: "retail", label: "Retail", mult: 1 },
@@ -38,6 +48,7 @@ export type SessionStats = {
   volumeBtc: number;
   bestTrade: number;
   rebalances: number;
+  aborted: number;
   startTs: number;
 };
 const emptySession = (): SessionStats => ({
@@ -46,27 +57,64 @@ const emptySession = (): SessionStats => ({
   volumeBtc: 0,
   bestTrade: 0,
   rebalances: 0,
+  aborted: 0,
   startTs: 0,
 });
 
-function initWallets(): Record<string, Wallet> {
+// Orden en dos fases: detectada en el tick N, re-verificada y ejecutada (o
+// abortada) contra el libro fresco del tick N+1 — la ventana de ejecución real.
+type PendingOrder = { opp: Opportunity; createdTs: number };
+
+const PARAMS_KEY = "atalaya.params.v1";
+const SESSION_KEY = "atalaya.session.v1";
+const SESSION_MAX_AGE_MS = 24 * 3600_000;
+
+type SavedSession = {
+  wallets: Record<string, Wallet>;
+  pnl: number;
+  peakPnl: number;
+  trades: Trade[];
+  equity: { t: number; pnl: number }[];
+  session: SessionStats;
+  transfers: Transfer[];
+  savedAt: number;
+};
+
+function loadParams(): EngineParams {
+  if (typeof window === "undefined") return freshDefaults();
+  try {
+    const raw = window.localStorage.getItem(PARAMS_KEY);
+    return raw ? mergeParams(JSON.parse(raw)) : freshDefaults();
+  } catch {
+    return freshDefaults();
+  }
+}
+
+function persistParams(p: EngineParams) {
+  try {
+    window.localStorage.setItem(PARAMS_KEY, JSON.stringify(p));
+  } catch {
+    /* storage lleno/bloqueado: seguimos en memoria */
+  }
+}
+
+function initWallets(p: EngineParams): Record<string, Wallet> {
   const w: Record<string, Wallet> = {};
-  for (const ex of Object.keys(TAKER_FEE)) w[ex] = { exchange: ex, usd: INITIAL_USD, btc: INITIAL_BTC };
+  for (const ex of EXCHANGES) w[ex] = { exchange: ex, usd: p.initialUsd, btc: p.initialBtc };
   return w;
 }
-const feeMultOf = (id: FeeTierId) => FEE_TIERS.find((t) => t.id === id)?.mult ?? 1;
 
 /** Toda la lógica del motor de arbitraje: feeds, tick, ejecución, métricas. */
 export function useArbEngine() {
+  const [params, setParamsState] = useState<EngineParams>(freshDefaults);
   const [books, setBooks] = useState<OrderBook[]>([]);
   const [opps, setOpps] = useState<Opportunity[]>([]);
   const [trades, setTrades] = useState<Trade[]>([]);
-  const [wallets, setWallets] = useState<Record<string, Wallet>>(initWallets);
+  const [wallets, setWallets] = useState<Record<string, Wallet>>(() => initWallets(freshDefaults()));
+  const [transfers, setTransfers] = useState<Transfer[]>([]);
   const [pnl, setPnl] = useState(0);
   const [equity, setEquity] = useState<{ t: number; pnl: number }[]>([]);
   const [running, setRunning] = useState(true);
-  const [feeTier, setFeeTier] = useState<FeeTierId>("vip");
-  const [makerMode, setMakerMode] = useState(false);
   const [serverLatency, setServerLatency] = useState(0);
   const [tickCount, setTickCount] = useState(0);
   const [feedStatus, setFeedStatus] = useState<Record<string, FeedStatus>>({});
@@ -75,44 +123,119 @@ export function useArbEngine() {
   const [metrics, setMetrics] = useState<Metrics>({ detP50: 0, detP99: 0, wsRate: 0, freshnessMs: 0 });
   const [stat, setStat] = useState<ZScore & { current: number }>({ mean: 0, std: 0, z: 0, n: 0, current: 0 });
   const [session, setSession] = useState<SessionStats>(emptySession);
+  const [chaos, setChaosState] = useState<ChaosState>(NO_CHAOS);
+  const [pendingPairs, setPendingPairs] = useState<string[]>([]);
+  const [restored, setRestored] = useState(false);
+  const [nowTs, setNowTs] = useState(0); // reloj del último tick (evita Date.now() en render)
 
   // Refs que el intervalo necesita leer "frescos" (evitan stale closures).
   const detTimesRef = useRef<number[]>([]);
   const spreadHistRef = useRef<number[]>([]);
   const sessionRef = useRef<SessionStats>(emptySession());
   const walletsRef = useRef(wallets);
+  const tradesRef = useRef<Trade[]>([]);
+  const equityRef = useRef<{ t: number; pnl: number }[]>([]);
+  const transfersRef = useRef<Transfer[]>([]);
+  const pendingRef = useRef<PendingOrder[]>([]);
+  const abortsRef = useRef(0); // abortos consecutivos → circuit breaker
   const pnlRef = useRef(pnl);
   const peakPnlRef = useRef(0);
   const runningRef = useRef(running);
-  const feeRef = useRef(feeTier);
-  const makerRef = useRef(makerMode);
+  const paramsRef = useRef(params);
+  const chaosRef = useRef(chaos);
+  const preChaosRef = useRef<{ merged: OrderBook[]; serverLatencyMs: number } | null>(null);
   const feedRef = useRef<LiveFeed | null>(null);
   const l2Ref = useRef<L2Feed | null>(null);
-  walletsRef.current = wallets;
-  pnlRef.current = pnl;
-  runningRef.current = running;
-  feeRef.current = feeTier;
-  makerRef.current = makerMode;
 
-  // Arranca los feeds WebSocket una vez: top-of-book (LiveFeed) + L2 completo.
+  // Sincronizar refs tras cada commit (los closures del intervalo los leen frescos).
   useEffect(() => {
+    walletsRef.current = wallets;
+    pnlRef.current = pnl;
+    runningRef.current = running;
+    paramsRef.current = params;
+    chaosRef.current = chaos;
+  }, [wallets, pnl, running, params, chaos]);
+
+  // Arranque (solo cliente): restaurar params + sesión persistida y abrir feeds.
+  useEffect(() => {
+    // La restauración corre en microtask: el estado persistido solo existe en
+    // el cliente y así el primer render coincide con el HTML del servidor.
+    queueMicrotask(() => {
+      const p = loadParams();
+      setParamsState(p);
+      paramsRef.current = p;
+
+      let sessionRestored = false;
+      try {
+        const raw = window.localStorage.getItem(SESSION_KEY);
+        if (raw) {
+          const saved = JSON.parse(raw) as SavedSession;
+          if (saved.savedAt && Date.now() - saved.savedAt < SESSION_MAX_AGE_MS) {
+            setWallets(saved.wallets);
+            walletsRef.current = saved.wallets;
+            setPnl(saved.pnl);
+            pnlRef.current = saved.pnl;
+            peakPnlRef.current = saved.peakPnl ?? Math.max(0, saved.pnl);
+            setTrades(saved.trades ?? []);
+            tradesRef.current = saved.trades ?? [];
+            setEquity(saved.equity ?? []);
+            equityRef.current = saved.equity ?? [];
+            sessionRef.current = { ...emptySession(), ...saved.session };
+            transfersRef.current = saved.transfers ?? [];
+            setTransfers(transfersRef.current);
+            sessionRestored = true;
+          }
+        }
+      } catch {
+        /* snapshot corrupto → sesión limpia */
+      }
+      if (!sessionRestored) {
+        const w = initWallets(p);
+        setWallets(w);
+        walletsRef.current = w;
+        sessionRef.current.startTs = Date.now();
+      }
+      setSession({ ...sessionRef.current });
+      setRestored(sessionRestored);
+    });
+
     const feed = new LiveFeed();
     feed.start();
     feedRef.current = feed;
     const l2 = new L2Feed();
     l2.start();
     l2Ref.current = l2;
-    sessionRef.current.startTs = Date.now();
-    setSession({ ...sessionRef.current });
+
+    // Autosave del snapshot de sesión (para sobrevivir recargas).
+    const saveId = setInterval(() => {
+      try {
+        const snap: SavedSession = {
+          wallets: walletsRef.current,
+          pnl: pnlRef.current,
+          peakPnl: peakPnlRef.current,
+          trades: tradesRef.current,
+          equity: equityRef.current,
+          session: sessionRef.current,
+          transfers: transfersRef.current,
+          savedAt: Date.now(),
+        };
+        window.localStorage.setItem(SESSION_KEY, JSON.stringify(snap));
+      } catch {
+        /* storage lleno/bloqueado */
+      }
+    }, 5000);
+
     return () => {
+      clearInterval(saveId);
       feed.close();
       l2.close();
     };
   }, []);
 
   const tick = useCallback(async () => {
-    const mult = feeMultOf(feeRef.current);
-    const maker = makerRef.current;
+    const p = paramsRef.current;
+    const c = chaosRef.current;
+    const now = Date.now();
 
     let payload: { books: OrderBook[]; serverLatencyMs: number };
     try {
@@ -123,29 +246,41 @@ export function useArbEngine() {
     }
 
     // Combinar REST + L2 + tops de WS (L2 preferido cuando es válido).
-    const { map, merged } = mergeBooks(
+    const fresh = mergeBooks(
       payload.books,
       l2Ref.current?.getBooks() ?? {},
       feedRef.current?.getTops() ?? {},
-      Date.now(),
+      now,
     );
+
+    // Modo caos: "congelar feeds" reusa el último snapshot pre-caos (su edad
+    // crece tick a tick hasta disparar el breaker de staleness). El resto de
+    // los escenarios se inyectan sobre el snapshot vigente.
+    let baseline = { merged: fresh.merged, serverLatencyMs: payload.serverLatencyMs };
+    if (c.freezeFeeds && preChaosRef.current) {
+      baseline = preChaosRef.current;
+    } else {
+      preChaosRef.current = baseline;
+    }
+    const { merged, map } = applyChaos(baseline.merged, c, now);
+
     setBooks(merged);
-    setServerLatency(payload.serverLatencyMs);
+    setServerLatency(baseline.serverLatencyMs);
     setFeedStatus({ ...(feedRef.current?.getStatus() ?? {}), ...(l2Ref.current?.getStatus() ?? {}) });
-    setTickCount((c) => c + 1);
+    setTickCount((cnt) => cnt + 1);
 
     // Detección (medimos su latencia de cómputo).
     const t0 = performance.now();
-    const detectedRaw = detectOpportunities(map, mult, maker);
+    const detectedRaw = detectOpportunities(map, p);
     detTimesRef.current = pushCapped(detTimesRef.current, performance.now() - t0, DET_WINDOW);
-    const detected = sanitizeOpportunities(detectedRaw);
+    const detected = sanitizeOpportunities(detectedRaw, p.risk.maxGrossBps);
     setOpps(detected);
 
     // Métricas de latencia/throughput.
     const wsRate =
       Object.values(feedRef.current?.getRates() ?? {}).reduce((a, b) => a + b, 0) +
       Object.values(l2Ref.current?.getRates() ?? {}).reduce((a, b) => a + b, 0);
-    const ages = merged.filter((b) => b.ok).map((b) => Date.now() - b.ts);
+    const ages = merged.filter((b) => b.ok).map((b) => now - b.ts);
     setMetrics({
       detP50: percentile(detTimesRef.current, 50),
       detP99: percentile(detTimesRef.current, 99),
@@ -162,50 +297,106 @@ export function useArbEngine() {
     s.oppsSeen += detectedRaw.length;
     s.viableSeen += detected.filter((o) => o.viable).length;
 
-    // Circuit breaker.
-    const r = evaluateRisk(merged, detectedRaw, pnlRef.current, peakPnlRef.current, Date.now());
+    // Circuit breaker (incluye abortos de ejecución consecutivos).
+    const r = evaluateRisk(merged, detectedRaw, pnlRef.current, peakPnlRef.current, now, p.risk, abortsRef.current);
     setRisk(r);
 
-    // Ejecución (si corre y el breaker no está disparado).
+    let w = walletsRef.current;
+    let walletsTouched = false;
+    const newTrades: Trade[] = [];
+    let gained = 0;
+
+    // Llegadas de transferencias de rebalanceo (confirmación on-chain simulada).
+    const arrivals = transfersRef.current.filter((t) => now >= t.arriveTs);
+    if (arrivals.length) {
+      for (const t of arrivals) w = creditTransfer(w, t);
+      transfersRef.current = transfersRef.current.filter((t) => now < t.arriveTs);
+      walletsTouched = true;
+    }
+
     if (runningRef.current && !r.tripped) {
-      let w = walletsRef.current;
-      const newTrades: Trade[] = [];
-      let gained = 0;
-      for (const opp of detected.filter((o) => o.viable)) {
-        const { trade, wallets: nextW } = simulateExecution(opp, map, w, mult, maker);
-        if (trade) {
-          w = nextW;
-          newTrades.push(trade);
-          gained += trade.netProfit;
-        }
-      }
-
-      // Rebalanceo de inventario si algún venue se agotó.
-      let rebalanceCost = 0;
-      const refP = referencePrice(merged);
-      if (refP && needsRebalance(w)) {
-        const rb = rebalance(w, refP);
-        w = rb.wallets;
-        rebalanceCost = rb.costUsd;
-        s.rebalances += 1;
-      }
-
-      if (newTrades.length || rebalanceCost > 0) {
-        setWallets(w);
-        const newPnl = pnlRef.current + gained - rebalanceCost;
-        setPnl(newPnl);
-        peakPnlRef.current = Math.max(peakPnlRef.current, newPnl);
-        if (newTrades.length) {
-          setTrades((prev) => [...newTrades.reverse(), ...prev].slice(0, TRADES_MAX));
-          for (const tr of newTrades) {
-            s.volumeBtc += tr.qty;
-            s.bestTrade = Math.max(s.bestTrade, tr.netProfit);
+      // FASE 2: órdenes creadas el tick pasado se re-verifican contra el libro
+      // fresco. Si el neto se derrumbó o el spread se cerró → aborto (visible).
+      const pend = pendingRef.current;
+      pendingRef.current = [];
+      for (const po of pend) {
+        const rc = recheckOpportunity(po.opp, map, p);
+        if (rc.ok && rc.fresh) {
+          const { trade, wallets: nextW } = simulateExecution(rc.fresh, map, w, p);
+          if (trade) {
+            trade.driftBps = rc.driftBps;
+            w = nextW;
+            walletsTouched = true;
+            newTrades.push(trade);
+            gained += trade.netProfit;
+            abortsRef.current = 0;
+            continue;
           }
+          newTrades.push(abortedTrade(po.opp, "liquidez o saldo insuficiente al ejecutar", rc.driftBps));
+        } else {
+          newTrades.push(abortedTrade(po.opp, rc.reason ?? "condiciones cambiaron", rc.driftBps));
         }
+        abortsRef.current += 1;
+        s.aborted += 1;
+      }
+
+      // FASE 1: lo viable detectado ahora entra como orden pendiente y se
+      // ejecutará (o abortará) el próximo tick — la ventana de ejecución.
+      const inFlight = new Set<string>();
+      for (const opp of detected.filter((o) => o.viable)) {
+        const key = `${opp.buyEx}>${opp.sellEx}`;
+        if (inFlight.has(key)) continue;
+        inFlight.add(key);
+        pendingRef.current.push({ opp, createdTs: now });
+      }
+
+      // Rebalanceo dirigido si algún venue se agotó y no viene nada en camino.
+      const projected = projectWallets(w, transfersRef.current);
+      const refP = referencePrice(merged);
+      if (refP && needsRebalance(projected, p.rebalance)) {
+        const plan = planRebalance(w, refP, p.rebalance, now);
+        if (plan.transfers.length) {
+          w = debitTransfers(w, plan.transfers);
+          transfersRef.current = [...transfersRef.current, ...plan.transfers];
+          walletsTouched = true;
+          const newPnl = pnlRef.current - plan.costUsd;
+          setPnl(newPnl);
+          pnlRef.current = newPnl;
+          s.rebalances += 1;
+        }
+      }
+    } else if (pendingRef.current.length) {
+      // Breaker activo o pausa: las órdenes pendientes se cancelan sin ejecutar.
+      pendingRef.current = [];
+    }
+
+    if (newTrades.length) {
+      const newPnl = pnlRef.current + gained;
+      setPnl(newPnl);
+      pnlRef.current = newPnl;
+      peakPnlRef.current = Math.max(peakPnlRef.current, newPnl);
+      setTrades((prev) => {
+        const next = [...newTrades.reverse(), ...prev].slice(0, TRADES_MAX);
+        tradesRef.current = next;
+        return next;
+      });
+      for (const tr of newTrades) {
+        if (tr.status !== "filled") continue;
+        s.volumeBtc += tr.qty;
+        s.bestTrade = Math.max(s.bestTrade, tr.netProfit);
       }
     }
+    if (walletsTouched) setWallets(w);
+
+    setTransfers([...transfersRef.current]);
+    setPendingPairs(pendingRef.current.map((po) => `${po.opp.buyEx}>${po.opp.sellEx}`));
+    setNowTs(now);
     setSession({ ...s });
-    setEquity((prev) => [...prev, { t: Date.now(), pnl: pnlRef.current }].slice(-EQUITY_WINDOW));
+    setEquity((prev) => {
+      const next = [...prev, { t: now, pnl: pnlRef.current }].slice(-EQUITY_WINDOW);
+      equityRef.current = next;
+      return next;
+    });
   }, []);
 
   // Bucle principal.
@@ -223,8 +414,9 @@ export function useArbEngine() {
         const res = await fetch("/api/triangular", { cache: "no-store" });
         const d = await res.json();
         if (!alive || !d.ok) return;
-        const base = makerRef.current ? (MAKER_FEE.coinbase ?? 0.004) : (TAKER_FEE.coinbase ?? 0.006);
-        setTri({ results: detectTriangular(d.books as TriBooks, base * feeMultOf(feeRef.current)), ts: d.ts });
+        const p = paramsRef.current;
+        const base = p.maker ? (p.makerFee.coinbase ?? 0.004) : (p.takerFee.coinbase ?? 0.006);
+        setTri({ results: detectTriangular(d.books as TriBooks, base * p.feeMult), ts: d.ts });
       } catch {
         /* feed opcional; se reintenta en el próximo intervalo */
       }
@@ -237,16 +429,67 @@ export function useArbEngine() {
     };
   }, []);
 
+  // --- Controles de parámetros (persisten en localStorage) ---
+  const patchParams = useCallback((patch: Partial<EngineParams>) => {
+    setParamsState((prev) => {
+      const next = { ...prev, ...patch };
+      persistParams(next);
+      return next;
+    });
+  }, []);
+
+  const applyPreset = useCallback((id: PresetId) => {
+    setParamsState((prev) => {
+      const preset = PRESETS.find((x) => x.id === id);
+      const next = preset ? preset.apply(prev) : prev;
+      persistParams(next);
+      return next;
+    });
+  }, []);
+
+  const resetParams = useCallback(() => {
+    const next = freshDefaults();
+    persistParams(next);
+    setParamsState(next);
+  }, []);
+
+  // --- Controles de caos (escenarios adversos, solo capa de simulación) ---
+  const setChaos = useCallback((updater: (c: ChaosState) => ChaosState) => {
+    setChaosState((prev) => updater(prev));
+  }, []);
+  const clearChaos = useCallback(() => setChaosState(NO_CHAOS), []);
+
+  // Re-armar el breaker manualmente (como en una mesa real: intervención humana).
+  const rearmBreaker = useCallback(() => {
+    abortsRef.current = 0;
+    peakPnlRef.current = pnlRef.current;
+  }, []);
+
   const reset = useCallback(() => {
-    setWallets(initWallets());
+    const p = paramsRef.current;
+    setWallets(initWallets(p));
     setTrades([]);
+    tradesRef.current = [];
     setPnl(0);
+    pnlRef.current = 0;
     peakPnlRef.current = 0;
     setEquity([]);
+    equityRef.current = [];
     setTickCount(0);
+    transfersRef.current = [];
+    setTransfers([]);
+    pendingRef.current = [];
+    setPendingPairs([]);
+    abortsRef.current = 0;
     sessionRef.current = { ...emptySession(), startTs: Date.now() };
     setSession({ ...sessionRef.current });
     spreadHistRef.current = [];
+    setRestored(false);
+    try {
+      window.localStorage.removeItem(SESSION_KEY);
+    } catch {
+      /* noop */
+    }
   }, []);
 
   return {
@@ -255,6 +498,7 @@ export function useArbEngine() {
     opps,
     trades,
     wallets,
+    transfers,
     pnl,
     equity,
     metrics,
@@ -266,11 +510,19 @@ export function useArbEngine() {
     serverLatency,
     tickCount,
     running,
-    feeTier,
-    makerMode,
+    params,
+    chaos,
+    chaosOn: chaosActive(chaos, nowTs),
+    pendingPairs,
+    restored,
+    nowTs,
     // controles
-    setFeeTier,
-    setMakerMode,
+    patchParams,
+    applyPreset,
+    resetParams,
+    setChaos,
+    clearChaos,
+    rearmBreaker,
     toggleRunning: () => setRunning((v) => !v),
     reset,
   };

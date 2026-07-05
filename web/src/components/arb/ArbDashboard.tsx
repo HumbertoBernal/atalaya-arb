@@ -12,7 +12,10 @@ import {
 import { EXCHANGE_LABEL, EXCHANGES } from "@/lib/arb/config";
 import { fmtDuration, fmtNum, fmtUsd } from "@/lib/arb/format";
 import type { FeedStatus } from "@/lib/arb/livefeed";
-import type { OrderBook, Opportunity, Trade, Wallet } from "@/lib/arb/types";
+import type { OrderBook, Trade, Transfer, Wallet } from "@/lib/arb/types";
+import { ChaosPanel } from "./ChaosPanel";
+import { ConfigPanel } from "./ConfigPanel";
+import { DepthChart } from "./DepthChart";
 import { SpreadMatrix } from "./SpreadMatrix";
 import { FEE_TIERS, useArbEngine } from "./useArbEngine";
 
@@ -30,15 +33,51 @@ function useFlash(value: number) {
   return dir === "up" ? "flash-up" : dir === "down" ? "flash-down" : "";
 }
 
+// Exporta el ledger como CSV (BOM para que Excel respete UTF-8).
+function exportCsv(trades: Trade[]) {
+  const header =
+    "fecha_iso,compra_en,venta_en,btc,btc_solicitado,precio_compra,precio_venta,fee_compra_usd,fee_venta_usd,bruto_usd,neto_usd,estado,deriva_bps,motivo";
+  const rows = trades.map((t) =>
+    [
+      new Date(t.ts).toISOString(),
+      t.buyEx,
+      t.sellEx,
+      t.qty.toFixed(6),
+      t.requestedQty.toFixed(6),
+      t.avgBuyPrice.toFixed(2),
+      t.avgSellPrice.toFixed(2),
+      t.buyFee.toFixed(2),
+      t.sellFee.toFixed(2),
+      t.grossProfit.toFixed(2),
+      t.netProfit.toFixed(2),
+      t.status === "aborted" ? "abortada" : t.partial ? "parcial" : "completa",
+      (t.driftBps ?? 0).toFixed(2),
+      t.abortReason ?? "",
+    ]
+      .map((x) => `"${String(x).replaceAll('"', '""')}"`)
+      .join(","),
+  );
+  const blob = new Blob(["﻿" + [header, ...rows].join("\n")], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `atalaya-ledger-${new Date().toISOString().slice(0, 19).replaceAll(":", "-")}.csv`;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
 export function ArbDashboard() {
   const e = useArbEngine();
   const okBooks = e.books.filter((b) => b.ok);
   const viableCount = e.opps.filter((o) => o.viable).length;
   const totalUsd = Object.values(e.wallets).reduce((s, w) => s + w.usd, 0);
   const totalBtc = Object.values(e.wallets).reduce((s, w) => s + w.btc, 0);
-  const partialCount = e.trades.filter((t) => t.partial).length;
+  const filled = e.trades.filter((t) => t.status === "filled");
+  const partialCount = filled.filter((t) => t.partial).length;
+  const abortedCount = e.trades.filter((t) => t.status === "aborted").length;
   const wsLive = Object.values(e.feedStatus).filter((s) => s === "live").length;
   const loading = e.books.length === 0;
+  const activeTier = FEE_TIERS.find((t) => Math.abs(t.mult - e.params.feeMult) < 1e-9);
 
   return (
     <main className="min-h-screen text-neutral-100 px-4 md:px-6 py-8">
@@ -50,14 +89,22 @@ export function ArbDashboard() {
               Atalaya <span className="text-cyan-400">· Arbitraje BTC</span>
             </h1>
             <p className="text-neutral-400 text-sm mt-1 max-w-2xl">
-              Detección en tiempo real (WebSocket) de divergencias entre exchanges, ejecución simulada neta
-              de fees, slippage, latencia y retiros.
+              Detección en tiempo real (WebSocket) de divergencias entre exchanges, ejecución simulada en dos
+              fases (con re-verificación) neta de fees, slippage, latencia y retiros.
             </p>
             <a href="/como-funciona.html" className="inline-block mt-2 text-sm text-cyan-400 hover:text-cyan-300">
               Cómo funciona y la matemática →
             </a>
           </div>
           <div className="flex items-center gap-2">
+            {e.restored && (
+              <span
+                className="rounded-full border border-cyan-800 bg-cyan-950/30 px-2.5 py-1 text-xs text-cyan-300"
+                title="Se restauró el P&L, ledger y wallets de tu última visita (localStorage). Reset lo limpia."
+              >
+                ⟳ Sesión restaurada
+              </span>
+            )}
             <button
               onClick={e.toggleRunning}
               className={`px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
@@ -74,8 +121,17 @@ export function ArbDashboard() {
 
         {/* Circuit breaker */}
         {e.risk.tripped && (
-          <div className="mb-5 rounded-lg border border-rose-700 bg-rose-950/40 p-3 text-sm text-rose-200">
-            <strong>🛑 Circuit breaker activo</strong> — ejecución detenida: {e.risk.reasons.join(" · ")}
+          <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-rose-700 bg-rose-950/40 p-3 text-sm text-rose-200">
+            <span>
+              <strong>🛑 Circuit breaker activo</strong> — ejecución detenida: {e.risk.reasons.join(" · ")}
+            </span>
+            <button
+              onClick={e.rearmBreaker}
+              className="rounded-lg border border-rose-600 px-2.5 py-1 text-xs text-rose-200 hover:bg-rose-900/50 transition-colors"
+              title="Intervención manual: reinicia el contador de abortos y toma el P&L actual como nuevo pico (como re-armar el kill-switch en una mesa real)."
+            >
+              ⟳ Re-armar
+            </button>
           </div>
         )}
 
@@ -87,9 +143,15 @@ export function ArbDashboard() {
               {fmtUsd(e.pnl)}
             </p>
             <div className="mt-3 flex flex-wrap gap-x-6 gap-y-1 text-xs text-neutral-500">
-              <span><span className="text-neutral-300 font-mono">{e.trades.length}</span> operaciones · {partialCount} parciales</span>
+              <span>
+                <span className="text-neutral-300 font-mono">{filled.length}</span> operaciones · {partialCount} parciales ·{" "}
+                <span className="text-amber-400/90 font-mono">{abortedCount}</span> abortadas
+              </span>
               <span><span className="text-neutral-300 font-mono">{fmtNum(totalBtc, 2)}</span> BTC inventario</span>
-              <span className="capitalize">Modo: {e.makerMode ? "maker" : "taker"} · {FEE_TIERS.find((t) => t.id === e.feeTier)?.label}</span>
+              <span className="capitalize">
+                Modo: {e.params.maker ? "maker" : "taker"} · {activeTier?.label ?? "fees custom"}
+                {e.params.minNetBps > 0 && ` · umbral ${e.params.minNetBps} bps`}
+              </span>
             </div>
           </div>
           <div className="rounded-2xl border border-emerald-900/40 bg-emerald-950/20 p-6 flex flex-col justify-center">
@@ -99,23 +161,27 @@ export function ArbDashboard() {
           </div>
         </section>
 
-        {/* Controles */}
+        {/* Controles rápidos */}
         <section className="mb-5 flex flex-wrap items-center gap-2 text-sm">
           <span className="text-neutral-400 inline-flex items-center">
             Tier de fees
-            <InfoTip>Simula qué comisión pagas, de retail (~0.4%) a HFT (~0). El mismo spread se vuelve rentable o no según el tier — por eso el arbitraje es un juego de bajo fee / alto volumen.</InfoTip>:
+            <InfoTip>Simula qué comisión pagas, de retail (~0.4%) a HFT (~0). El mismo spread se vuelve rentable o no según el tier — por eso el arbitraje es un juego de bajo fee / alto volumen. Los fees base por exchange son editables en Parámetros.</InfoTip>:
           </span>
           {FEE_TIERS.map((t) => (
-            <Toggle key={t.id} active={e.feeTier === t.id} onClick={() => e.setFeeTier(t.id)}>{t.label}</Toggle>
+            <Toggle key={t.id} active={activeTier?.id === t.id} onClick={() => e.patchParams({ feeMult: t.mult })}>{t.label}</Toggle>
           ))}
           <span className="mx-2 text-neutral-700">|</span>
           <span className="text-neutral-400 inline-flex items-center">
             Ejecución
-            <InfoTip>Taker = orden inmediata (fee mayor). Maker = orden límite (fee menor, viable en retail) pero solo se llena ~55% de las veces — modelamos ese riesgo de ejecución.</InfoTip>:
+            <InfoTip>Taker = orden inmediata (fee mayor). Maker = orden límite (fee menor, viable en retail) pero con fill incierto — la probabilidad es configurable en Parámetros.</InfoTip>:
           </span>
-          <Toggle active={!e.makerMode} onClick={() => e.setMakerMode(false)}>Taker</Toggle>
-          <Toggle active={e.makerMode} onClick={() => e.setMakerMode(true)}>Maker (límite)</Toggle>
+          <Toggle active={!e.params.maker} onClick={() => e.patchParams({ maker: false })}>Taker</Toggle>
+          <Toggle active={e.params.maker} onClick={() => e.patchParams({ maker: true })}>Maker (límite)</Toggle>
         </section>
+
+        {/* Parametrización profunda + escenarios adversos */}
+        <ConfigPanel params={e.params} patchParams={e.patchParams} applyPreset={e.applyPreset} resetParams={e.resetParams} />
+        <ChaosPanel chaos={e.chaos} chaosOn={e.chaosOn} now={e.nowTs} setChaos={e.setChaos} clearChaos={e.clearChaos} />
 
         {/* Métricas (status strip secundario) */}
         <section className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
@@ -132,7 +198,14 @@ export function ArbDashboard() {
             <div className="space-y-1">
               {loading
                 ? Array.from({ length: 5 }).map((_, i) => <SkeletonRow key={i} />)
-                : e.books.map((b) => <BookRow key={b.exchange} book={b} status={e.feedStatus[b.exchange]} />)}
+                : e.books.map((b) => (
+                    <BookRow
+                      key={b.exchange}
+                      book={b}
+                      status={e.feedStatus[b.exchange]}
+                      inactive={!(e.params.activeExchanges[b.exchange] ?? true)}
+                    />
+                  ))}
             </div>
           </Panel>
 
@@ -156,7 +229,7 @@ export function ArbDashboard() {
         </div>
 
         {/* Oportunidades */}
-        <Panel className="mt-6" title="Oportunidades cross-exchange">
+        <Panel className="mt-6" title="Oportunidades cross-exchange" right={e.pendingPairs.length ? `${e.pendingPairs.length} en ejecución` : undefined}>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead className="text-neutral-400 border-b border-neutral-800">
@@ -174,17 +247,32 @@ export function ArbDashboard() {
                 {loading && Array.from({ length: 4 }).map((_, i) => (
                   <tr key={i}><td colSpan={7} className="py-2"><div className="h-3 rounded bg-neutral-800 animate-pulse" /></td></tr>
                 ))}
-                {!loading && e.opps.slice(0, 8).map((o) => (
-                  <tr key={`${o.buyEx}-${o.sellEx}`} className="border-b border-neutral-800/40">
-                    <td className="py-2">{EXCHANGE_LABEL[o.buyEx]} → {EXCHANGE_LABEL[o.sellEx]}</td>
-                    <td className="text-right font-mono">{o.grossBps.toFixed(1)} bps</td>
-                    <td className="text-right font-mono">{o.maxQty > 0 ? fmtNum(o.maxQty, 3) : "—"}</td>
-                    <td className="text-right font-mono text-neutral-500">{fmtUsd(o.feesCost)}</td>
-                    <td className="text-right font-mono text-neutral-500">{fmtUsd(o.latencyCost)}</td>
-                    <td className={`text-right font-mono ${o.netProfit > 0 ? "text-emerald-400" : "text-neutral-500"}`}>{fmtUsd(o.netProfit)}</td>
-                    <td className="text-right">{o.viable ? <span className="text-emerald-400 text-xs">✓ viable</span> : <span className="text-neutral-500 text-xs">no neto</span>}</td>
-                  </tr>
-                ))}
+                {!loading && e.opps.slice(0, 8).map((o) => {
+                  const pending = e.pendingPairs.includes(`${o.buyEx}>${o.sellEx}`);
+                  return (
+                    <tr key={`${o.buyEx}-${o.sellEx}`} className="border-b border-neutral-800/40">
+                      <td className="py-2">{EXCHANGE_LABEL[o.buyEx]} → {EXCHANGE_LABEL[o.sellEx]}</td>
+                      <td className="text-right font-mono">{o.grossBps.toFixed(1)} bps</td>
+                      <td className="text-right font-mono">{o.maxQty > 0 ? fmtNum(o.maxQty, 3) : "—"}</td>
+                      <td className="text-right font-mono text-neutral-500">{fmtUsd(o.feesCost)}</td>
+                      <td className="text-right font-mono text-neutral-500">{fmtUsd(o.latencyCost)}</td>
+                      <td className={`text-right font-mono ${o.netProfit > 0 ? "text-emerald-400" : "text-neutral-500"}`}>{fmtUsd(o.netProfit)}</td>
+                      <td className="text-right">
+                        {o.viable ? (
+                          pending ? (
+                            <span className="text-cyan-300 text-xs" title="Detectada el tick pasado; se re-verifica contra el libro fresco antes de ejecutar.">⏳ ejecutando</span>
+                          ) : (
+                            <span className="text-emerald-400 text-xs">✓ viable</span>
+                          )
+                        ) : o.netProfit > 0 ? (
+                          <span className="text-amber-500/80 text-xs" title={`Neto positivo pero bajo tu umbral de ${e.params.minNetBps} bps.`}>bajo umbral</span>
+                        ) : (
+                          <span className="text-neutral-500 text-xs">no neto</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
                 {!loading && e.opps.length === 0 && (
                   <tr><td colSpan={7} className="text-center text-neutral-500 py-4">Mercado eficiente ahora mismo — sin divergencias netas. Prueba el tier VIP/Maker.</td></tr>
                 )}
@@ -201,6 +289,10 @@ export function ArbDashboard() {
         </Panel>
 
         <div className="grid md:grid-cols-2 gap-6 mt-6">
+          <Panel title="Profundidad del libro" subtitle="liquidez acumulada · slippage visible">
+            <DepthChart books={e.books} />
+          </Panel>
+
           <Panel title="Arbitraje estadístico">
             <p className="text-sm text-neutral-400 mb-3">Z-score del mayor spread vs su media móvil. |z| alto = spread inusual (mean-reversion).</p>
             <div className="grid grid-cols-3 gap-3 text-center">
@@ -210,53 +302,79 @@ export function ArbDashboard() {
             </div>
             {Math.abs(e.stat.z) > 2 && <p className="text-amber-400 text-xs mt-3">⚡ Spread {e.stat.z > 0 ? "inusualmente amplio" : "comprimido"} — posible mean-reversion.</p>}
           </Panel>
+        </div>
 
+        <div className="grid md:grid-cols-2 gap-6 mt-6">
           <Panel title="Analítica de sesión">
             <div className="grid grid-cols-2 gap-x-6 gap-y-1 text-sm">
-              <Stat label="Tiempo activo" value={fmtDuration(Date.now() - (e.session.startTs || Date.now()))} />
+              <Stat label="Tiempo activo" value={e.nowTs && e.session.startTs ? fmtDuration(e.nowTs - e.session.startTs) : "—"} />
               <Stat label="Oportunidades vistas" value={e.session.oppsSeen.toLocaleString()} />
               <Stat label="Viables detectadas" value={e.session.viableSeen.toLocaleString()} />
-              <Stat label="Capture rate" value={e.session.viableSeen ? `${((e.trades.length / e.session.viableSeen) * 100).toFixed(0)}%` : "—"} />
+              <Stat label="Capture rate" value={e.session.viableSeen ? `${((filled.length / e.session.viableSeen) * 100).toFixed(0)}%` : "—"} />
               <Stat label="Volumen operado" value={`${fmtNum(e.session.volumeBtc, 3)} BTC`} />
               <Stat label="Mejor operación" value={fmtUsd(e.session.bestTrade)} />
+              <Stat label="Abortadas (re-check)" value={`${e.session.aborted}`} />
               <Stat label="Rebalanceos" value={`${e.session.rebalances}`} />
+            </div>
+          </Panel>
+
+          <Panel title="Arbitraje triangular" subtitle="Coinbase · USD/BTC/ETH">
+            <p className="text-sm text-neutral-400 mb-3">Ciclos intra-exchange sin mover fondos entre plataformas.</p>
+            <div className="grid sm:grid-cols-2 gap-3">
+              {e.tri
+                ? e.tri.results.map((r) => (
+                    <div key={r.direction} className="rounded-lg border border-neutral-800 bg-neutral-950/50 p-3">
+                      <div className="font-mono text-xs text-neutral-300">{r.direction}</div>
+                      <div className="flex items-center justify-between mt-1">
+                        <span className={`text-lg font-semibold font-mono ${r.viable ? "text-emerald-400" : "text-rose-400"}`}>{r.netBps.toFixed(1)} bps</span>
+                        <span className="text-xs text-neutral-500">{r.viable ? "✓ viable" : "no rentable"}</span>
+                      </div>
+                    </div>
+                  ))
+                : Array.from({ length: 2 }).map((_, i) => <div key={i} className="h-16 rounded-lg bg-neutral-900 animate-pulse" />)}
             </div>
           </Panel>
         </div>
 
-        {/* Triangular */}
-        <Panel className="mt-6" title="Arbitraje triangular" subtitle="Coinbase · USD/BTC/ETH">
-          <p className="text-sm text-neutral-400 mb-3">Ciclos intra-exchange sin mover fondos entre plataformas.</p>
-          <div className="grid sm:grid-cols-2 gap-3">
-            {e.tri
-              ? e.tri.results.map((r) => (
-                  <div key={r.direction} className="rounded-lg border border-neutral-800 bg-neutral-950/50 p-3">
-                    <div className="font-mono text-xs text-neutral-300">{r.direction}</div>
-                    <div className="flex items-center justify-between mt-1">
-                      <span className={`text-lg font-semibold font-mono ${r.viable ? "text-emerald-400" : "text-rose-400"}`}>{r.netBps.toFixed(1)} bps</span>
-                      <span className="text-xs text-neutral-500">{r.viable ? "✓ viable" : "no rentable"}</span>
-                    </div>
-                  </div>
-                ))
-              : Array.from({ length: 2 }).map((_, i) => <div key={i} className="h-16 rounded-lg bg-neutral-900 animate-pulse" />)}
-          </div>
-        </Panel>
-
         <SectionHeader n="03" title="Ledger" className="mt-10" />
         <div className="grid lg:grid-cols-2 gap-6">
-          <Panel title="Operaciones ejecutadas">
+          <Panel
+            title="Operaciones"
+            subtitle="fills, parciales y abortos"
+            right={e.trades.length ? undefined : ""}
+            action={
+              e.trades.length > 0 ? (
+                <button
+                  onClick={() => exportCsv(e.trades)}
+                  className="rounded-md border border-neutral-700 px-2 py-1 text-xs text-neutral-300 hover:border-cyan-500 hover:text-cyan-200 transition-colors"
+                >
+                  ⇩ CSV
+                </button>
+              ) : undefined
+            }
+          >
             <div className="space-y-1 max-h-72 overflow-y-auto">
               {e.trades.length === 0 && <p className="text-neutral-500 text-sm">Aún sin operaciones netas-positivas.</p>}
-              {e.trades.map((t) => (
-                <div key={t.id + t.ts} className="row-enter flex items-center justify-between text-xs py-1 border-b border-neutral-800/40">
-                  <span className="text-neutral-300">
-                    {EXCHANGE_LABEL[t.buyEx]} → {EXCHANGE_LABEL[t.sellEx]}
-                    {t.partial && <span className="text-amber-500 ml-1">(parcial)</span>}
-                  </span>
-                  <span className="font-mono text-neutral-400">{fmtNum(t.qty, 4)} BTC</span>
-                  <span className="font-mono text-emerald-400">{fmtUsd(t.netProfit)}</span>
-                </div>
-              ))}
+              {e.trades.map((t) =>
+                t.status === "aborted" ? (
+                  <div key={t.id + t.ts} className="row-enter flex items-center justify-between text-xs py-1 border-b border-neutral-800/40">
+                    <span className="text-amber-400/90">
+                      ✕ {EXCHANGE_LABEL[t.buyEx]} → {EXCHANGE_LABEL[t.sellEx]}
+                      <span className="text-neutral-500 ml-1">abortada: {t.abortReason}</span>
+                    </span>
+                    <span className="font-mono text-neutral-500">{t.driftBps !== undefined ? `Δ${t.driftBps.toFixed(1)} bps` : ""}</span>
+                  </div>
+                ) : (
+                  <div key={t.id + t.ts} className="row-enter flex items-center justify-between text-xs py-1 border-b border-neutral-800/40">
+                    <span className="text-neutral-300">
+                      {EXCHANGE_LABEL[t.buyEx]} → {EXCHANGE_LABEL[t.sellEx]}
+                      {t.partial && <span className="text-amber-500 ml-1">(parcial)</span>}
+                    </span>
+                    <span className="font-mono text-neutral-400">{fmtNum(t.qty, 4)} BTC</span>
+                    <span className="font-mono text-emerald-400">{fmtUsd(t.netProfit)}</span>
+                  </div>
+                ),
+              )}
             </div>
           </Panel>
 
@@ -264,13 +382,24 @@ export function ArbDashboard() {
             <div className="space-y-1">
               {Object.values(e.wallets).map((w) => <WalletRow key={w.exchange} wallet={w} />)}
             </div>
+            {e.transfers.length > 0 && (
+              <div className="mt-3 rounded-lg border border-cyan-900/50 bg-cyan-950/20 p-3">
+                <p className="text-xs uppercase tracking-[0.15em] text-cyan-500/80 mb-1.5">
+                  En tránsito (confirmando on-chain)
+                </p>
+                {e.transfers.map((t) => (
+                  <TransferRow key={t.id} transfer={t} now={e.nowTs} />
+                ))}
+              </div>
+            )}
           </Panel>
         </div>
 
         <p className="text-xs text-neutral-600 mt-8 max-w-3xl">
           Simulación educativa / demo (no opera capital real). Net = bruto − fees − slippage (order book real) −
-          adverse selection por latencia − retiro amortizado. Feeds: WebSocket L2 (Kraken/Bitstamp/Bitfinex/Gemini) +
-          REST (Coinbase).
+          adverse selection por latencia − retiro amortizado. Ejecución en dos fases: cada orden se re-verifica
+          contra el libro fresco antes de llenarse. Feeds: WebSocket L2 (Kraken/Bitstamp/Bitfinex/Gemini) +
+          ticker WS y REST (Coinbase).
         </p>
       </div>
     </main>
@@ -279,8 +408,8 @@ export function ArbDashboard() {
 
 /* ---------- Componentes presentacionales ---------- */
 
-function Panel({ title, subtitle, right, className = "", children }: {
-  title: string; subtitle?: string; right?: string; className?: string; children: React.ReactNode;
+function Panel({ title, subtitle, right, action, className = "", children }: {
+  title: string; subtitle?: string; right?: string; action?: React.ReactNode; className?: string; children: React.ReactNode;
 }) {
   return (
     <section className={`rounded-xl border border-neutral-800 bg-neutral-900/50 p-5 ${className}`}>
@@ -289,7 +418,7 @@ function Panel({ title, subtitle, right, className = "", children }: {
           {title}
           {subtitle && <span className="text-neutral-500 text-sm font-normal"> · {subtitle}</span>}
         </h2>
-        {right && <span className="text-xs text-neutral-500 font-mono">{right}</span>}
+        {action ?? (right && <span className="text-xs text-neutral-500 font-mono">{right}</span>)}
       </div>
       {children}
     </section>
@@ -330,17 +459,18 @@ function InfoTip({ children }: { children: React.ReactNode }) {
   );
 }
 
-function BookRow({ book, status }: { book: OrderBook; status?: FeedStatus }) {
+function BookRow({ book, status, inactive }: { book: OrderBook; status?: FeedStatus; inactive?: boolean }) {
   const bid = book.bids[0]?.price ?? 0;
   const ask = book.asks[0]?.price ?? 0;
   const bidFlash = useFlash(bid);
   const askFlash = useFlash(ask);
   const live = status === "live";
   return (
-    <div className="flex items-center justify-between text-sm py-1.5 border-b border-neutral-800/50">
-      <span className="font-medium w-24 flex items-center gap-1.5">
+    <div className={`flex items-center justify-between text-sm py-1.5 border-b border-neutral-800/50 ${inactive ? "opacity-40" : ""}`}>
+      <span className="font-medium w-28 flex items-center gap-1.5">
         {EXCHANGE_LABEL[book.exchange] ?? book.exchange}
         <span className={`w-1.5 h-1.5 rounded-full ${live ? "bg-emerald-400 live-dot" : "bg-neutral-600"}`} title={live ? "WebSocket en vivo" : "REST"} />
+        {inactive && <span className="text-[10px] text-neutral-500 border border-neutral-700 rounded px-1">off</span>}
       </span>
       {book.ok ? (
         <>
@@ -361,6 +491,21 @@ function WalletRow({ wallet }: { wallet: Wallet }) {
       <span className="w-24">{EXCHANGE_LABEL[wallet.exchange]}</span>
       <span className="font-mono text-neutral-300">{fmtUsd(wallet.usd)}</span>
       <span className="font-mono text-neutral-400">{fmtNum(wallet.btc, 4)} BTC</span>
+    </div>
+  );
+}
+
+function TransferRow({ transfer: t, now }: { transfer: Transfer; now: number }) {
+  const eta = Math.max(0, Math.ceil((t.arriveTs - now) / 1000));
+  return (
+    <div className="flex items-center justify-between text-xs py-0.5 text-cyan-200/90">
+      <span>
+        {EXCHANGE_LABEL[t.from]} → {EXCHANGE_LABEL[t.to]}
+      </span>
+      <span className="font-mono">
+        {t.asset === "btc" ? `${fmtNum(t.amount, 4)} BTC` : fmtUsd(t.amount)}
+      </span>
+      <span className="font-mono text-cyan-400/70">llega en ~{eta}s</span>
     </div>
   );
 }

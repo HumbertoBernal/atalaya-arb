@@ -1,17 +1,8 @@
 // Motor de arbitraje: detección, cálculo de rentabilidad neta y simulación.
-// Funciones puras → testeables y deterministas.
-import {
-  BTC_VOL_PER_SEC,
-  MAKER_FEE,
-  MAKER_FILL_PROB,
-  MAX_TRADE_BTC,
-  NETWORK_LATENCY_MS,
-  REBALANCE_EVERY,
-  TAKER_FEE,
-  WITHDRAWAL_FEE_BTC,
-} from "./config";
-
-const feeTable = (maker: boolean) => (maker ? MAKER_FEE : TAKER_FEE);
+// Funciones puras → testeables y deterministas. Todos los tunables llegan por
+// EngineParams (inyección explícita): nada se lee de estado global, así la UI
+// puede reconfigurar el motor en runtime sin recargar.
+import { DEFAULT_PARAMS, feeOf, isActive, type EngineParams } from "./params";
 import type { Level, OrderBook, OrderBooks, Opportunity, Trade, Wallet } from "./types";
 
 const EPS = 1e-9;
@@ -29,13 +20,14 @@ export function frictionCosts(
   sellEx: string,
   qty: number,
   avgPrice: number,
+  p: EngineParams = DEFAULT_PARAMS,
 ): { latencyCost: number; withdrawalCost: number } {
-  const latencySec = ((NETWORK_LATENCY_MS[buyEx] ?? 150) + (NETWORK_LATENCY_MS[sellEx] ?? 150)) / 1000;
-  const adversePerBtc = avgPrice * BTC_VOL_PER_SEC * Math.sqrt(latencySec); // 1σ
+  const latencySec = ((p.latencyMs[buyEx] ?? 150) + (p.latencyMs[sellEx] ?? 150)) / 1000;
+  const adversePerBtc = avgPrice * p.btcVolPerSec * Math.sqrt(latencySec); // 1σ
   const latencyCost = adversePerBtc * qty;
 
-  const withdrawalBtc = (WITHDRAWAL_FEE_BTC[buyEx] ?? 0) + (WITHDRAWAL_FEE_BTC[sellEx] ?? 0);
-  const withdrawalCost = (withdrawalBtc / REBALANCE_EVERY) * avgPrice;
+  const withdrawalBtc = (p.withdrawalFeeBtc[buyEx] ?? 0) + (p.withdrawalFeeBtc[sellEx] ?? 0);
+  const withdrawalCost = (withdrawalBtc / p.rebalanceEvery) * avgPrice;
 
   return { latencyCost, withdrawalCost };
 }
@@ -96,55 +88,67 @@ export function optimalArb(
   };
 }
 
-/** Detecta todas las oportunidades viables entre pares de exchanges.
- *  feeMult escala los fees (1 = retail; <1 simula tiers VIP/HFT). */
-export function detectOpportunities(books: OrderBooks, feeMult = 1, maker = false): Opportunity[] {
-  const fees = feeTable(maker);
-  const ids = Object.keys(books).filter((id) => books[id].ok && books[id].asks.length && books[id].bids.length);
+/**
+ * Evalúa el par (buyEx → sellEx) sobre los libros actuales: núcleo compartido
+ * por la detección y la re-verificación pre-ejecución (dos fases).
+ */
+export function evalPair(
+  buyEx: string,
+  sellEx: string,
+  books: OrderBooks,
+  p: EngineParams = DEFAULT_PARAMS,
+): Opportunity | null {
+  const buyBook = books[buyEx];
+  const sellBook = books[sellEx];
+  if (!buyBook?.ok || !sellBook?.ok || !buyBook.asks.length || !sellBook.bids.length) return null;
+
+  const buyAsk = buyBook.asks[0].price;
+  const sellBid = sellBook.bids[0].price;
+  const grossSpread = sellBid - buyAsk;
+
+  const buyFee = feeOf(p, buyEx);
+  const sellFee = feeOf(p, sellEx);
+  const { qty, buyCost, sellProceeds } = optimalArb(buyBook.asks, sellBook.bids, buyFee, sellFee, p.maxTradeBtc);
+
+  const feesUsd = buyCost * buyFee + sellProceeds * sellFee;
+  const avgPrice = qty > 0 ? buyCost / qty : buyAsk;
+  const { latencyCost, withdrawalCost } = frictionCosts(buyEx, sellEx, qty, avgPrice, p);
+  const netProfit = sellProceeds - buyCost - feesUsd - latencyCost - withdrawalCost;
+  const netPerBtc = qty > 0 ? netProfit / qty : 0;
+  const netBps = buyCost > 0 ? (netProfit / buyCost) * 10_000 : 0;
+
+  return {
+    buyEx,
+    sellEx,
+    buyAsk,
+    sellBid,
+    grossSpread,
+    grossBps: (grossSpread / buyAsk) * 10_000,
+    maxQty: qty,
+    feesCost: feesUsd,
+    latencyCost,
+    withdrawalCost,
+    netPerBtc,
+    netProfit,
+    netBps,
+    // Viable = neto positivo Y por encima del umbral configurado por el usuario.
+    viable: netProfit > 0 && qty > EPS && netBps >= p.minNetBps,
+  };
+}
+
+/** Detecta todas las oportunidades entre pares de exchanges ACTIVOS. */
+export function detectOpportunities(books: OrderBooks, p: EngineParams = DEFAULT_PARAMS): Opportunity[] {
+  const ids = Object.keys(books).filter(
+    (id) => books[id].ok && books[id].asks.length && books[id].bids.length && isActive(p, id),
+  );
   const opps: Opportunity[] = [];
 
   for (const buyEx of ids) {
     for (const sellEx of ids) {
       if (buyEx === sellEx) continue;
-      const buyBook = books[buyEx];
-      const sellBook = books[sellEx];
-      const buyAsk = buyBook.asks[0].price;
-      const sellBid = sellBook.bids[0].price;
-      const grossSpread = sellBid - buyAsk;
-      if (grossSpread <= 0) continue; // ni siquiera bruto
-
-      const buyFee = (fees[buyEx] ?? 0.005) * feeMult;
-      const sellFee = (fees[sellEx] ?? 0.005) * feeMult;
-      const { qty, buyCost, sellProceeds } = optimalArb(
-        buyBook.asks,
-        sellBook.bids,
-        buyFee,
-        sellFee,
-        MAX_TRADE_BTC,
-      );
-
-      const feesUsd = buyCost * buyFee + sellProceeds * sellFee;
-      const avgPrice = qty > 0 ? buyCost / qty : buyAsk;
-      const { latencyCost, withdrawalCost } = frictionCosts(buyEx, sellEx, qty, avgPrice);
-      const netProfit = sellProceeds - buyCost - feesUsd - latencyCost - withdrawalCost;
-      const netPerBtc = qty > 0 ? netProfit / qty : 0;
-
-      opps.push({
-        buyEx,
-        sellEx,
-        buyAsk,
-        sellBid,
-        grossSpread,
-        grossBps: (grossSpread / buyAsk) * 10_000,
-        maxQty: qty,
-        feesCost: feesUsd,
-        latencyCost,
-        withdrawalCost,
-        netPerBtc,
-        netProfit,
-        netBps: buyCost > 0 ? (netProfit / buyCost) * 10_000 : 0,
-        viable: netProfit > 0 && qty > EPS,
-      });
+      const opp = evalPair(buyEx, sellEx, books, p);
+      if (!opp || opp.grossSpread <= 0) continue; // ni siquiera bruto
+      opps.push(opp);
     }
   }
 
@@ -159,17 +163,16 @@ export function simulateExecution(
   opp: Opportunity,
   books: OrderBooks,
   wallets: Record<string, Wallet>,
-  feeMult = 1,
-  maker = false,
+  p: EngineParams = DEFAULT_PARAMS,
 ): { trade: Trade | null; wallets: Record<string, Wallet> } {
-  const fees = feeTable(maker);
   const buyW = wallets[opp.buyEx];
   const sellW = wallets[opp.sellEx];
-  const buyFee = (fees[opp.buyEx] ?? 0.005) * feeMult;
-  const sellFee = (fees[opp.sellEx] ?? 0.005) * feeMult;
+  if (!buyW || !sellW) return { trade: null, wallets };
+  const buyFee = feeOf(p, opp.buyEx);
+  const sellFee = feeOf(p, opp.sellEx);
 
   // Tope por liquidez (recalculado) y por saldos disponibles.
-  const liq = optimalArb(books[opp.buyEx].asks, books[opp.sellEx].bids, buyFee, sellFee, MAX_TRADE_BTC);
+  const liq = optimalArb(books[opp.buyEx].asks, books[opp.sellEx].bids, buyFee, sellFee, p.maxTradeBtc);
   let qty = liq.qty;
   if (qty <= EPS) return { trade: null, wallets };
 
@@ -181,7 +184,7 @@ export function simulateExecution(
   qty = Math.min(qty, maxByUsd, maxByBtc);
   // Modo maker: la orden límite solo se llena con cierta probabilidad antes de
   // que el spread se cierre → el volumen esperado ejecutado es menor.
-  if (maker) qty *= MAKER_FILL_PROB;
+  if (p.maker) qty *= p.makerFillProb;
   if (qty <= EPS) return { trade: null, wallets };
 
   // Re-walk para la qty final (precios promedio reales con slippage).
@@ -191,10 +194,12 @@ export function simulateExecution(
   const buyFeeUsd = buyCost * buyFee;
   const sellFeeUsd = sellProceeds * sellFee;
   const grossProfit = sellProceeds - buyCost;
-  const { latencyCost, withdrawalCost } = frictionCosts(opp.buyEx, opp.sellEx, exec.qty, exec.avgBuy);
+  const { latencyCost, withdrawalCost } = frictionCosts(opp.buyEx, opp.sellEx, exec.qty, exec.avgBuy, p);
   const netProfit = grossProfit - buyFeeUsd - sellFeeUsd - latencyCost - withdrawalCost;
 
   if (netProfit <= 0) return { trade: null, wallets };
+  // Umbral configurado: por debajo del margen mínimo tampoco ejecutamos.
+  if (buyCost > 0 && (netProfit / buyCost) * 10_000 < p.minNetBps) return { trade: null, wallets };
 
   // Actualizar wallets.
   const next = { ...wallets };
@@ -224,9 +229,59 @@ export function simulateExecution(
     grossProfit,
     netProfit,
     partial: exec.qty < requested - EPS,
+    status: "filled",
   };
 
   return { trade, wallets: next };
+}
+
+/**
+ * Re-verificación pre-ejecución (fase 2 de la ejecución en dos fases):
+ * la orden se creó sobre un snapshot y el mercado siguió moviéndose. Sobre los
+ * libros FRESCOS decide si sigue valiendo la pena:
+ *  - neto fresco ≤ 0 → abortar (el spread se cerró);
+ *  - el neto cayó más de recheckTolBps vs lo esperado → abortar (deriva excesiva).
+ */
+export function recheckOpportunity(
+  expected: Opportunity,
+  freshBooks: OrderBooks,
+  p: EngineParams = DEFAULT_PARAMS,
+): { ok: boolean; fresh: Opportunity | null; driftBps: number; reason?: string } {
+  const fresh = evalPair(expected.buyEx, expected.sellEx, freshBooks, p);
+  if (!fresh || fresh.maxQty <= EPS || fresh.netProfit <= 0) {
+    const driftBps = expected.netBps - (fresh?.netBps ?? 0);
+    return { ok: false, fresh, driftBps, reason: "el spread se cerró durante la ejecución" };
+  }
+  const driftBps = expected.netBps - fresh.netBps;
+  if (driftBps > p.recheckTolBps) {
+    return { ok: false, fresh, driftBps, reason: `deriva ${driftBps.toFixed(1)} bps > tolerancia` };
+  }
+  if (fresh.netBps < p.minNetBps) {
+    return { ok: false, fresh, driftBps, reason: "cayó bajo el umbral mínimo" };
+  }
+  return { ok: true, fresh, driftBps };
+}
+
+/** Entrada de ledger para una orden abortada por la re-verificación. */
+export function abortedTrade(opp: Opportunity, reason: string, driftBps: number): Trade {
+  return {
+    id: `abort-${opp.buyEx}-${opp.sellEx}-${Date.now()}`,
+    ts: Date.now(),
+    buyEx: opp.buyEx,
+    sellEx: opp.sellEx,
+    qty: 0,
+    requestedQty: opp.maxQty,
+    avgBuyPrice: opp.buyAsk,
+    avgSellPrice: opp.sellBid,
+    buyFee: 0,
+    sellFee: 0,
+    grossProfit: 0,
+    netProfit: 0,
+    partial: false,
+    status: "aborted",
+    driftBps,
+    abortReason: reason,
+  };
 }
 
 /** Valor total en USD de todas las wallets (BTC valuado a un precio de referencia). */
