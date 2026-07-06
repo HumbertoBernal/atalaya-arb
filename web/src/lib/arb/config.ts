@@ -47,6 +47,12 @@ export const EXCHANGE_LABEL: Record<string, string> = {
 // Tope de notional por operación simulada (gestión de riesgo / circuit breaker simple).
 export const MAX_TRADE_BTC = 1.5;
 
+// Tope por INVENTARIO: fracción máxima de la wallet del venue usable en una
+// orden. Sin esto, una sola orden de 1.5 BTC (~$95k) drena un venue de $100k
+// de golpe → rebalanceo constante → los fees de red se comen el micro-edge.
+// Las mesas reales dimensionan contra su inventario, no contra un número fijo.
+export const MAX_WALLET_FRAC = 0.25;
+
 // Saldos iniciales por exchange (USD y BTC pre-posicionados para arbitraje).
 export const INITIAL_USD = 100_000;
 export const INITIAL_BTC = 2;
@@ -71,6 +77,9 @@ export const REBALANCE = {
   minUsd: 5_000,        // si el USD de un venue baja de esto → rebalancear
   minBtc: 0.1,          // si el BTC de un venue baja de esto → rebalancear
   btcNetworkFee: 0.0003, // fee de red por transferencia BTC entre venues
+  minIntervalSec: 90,   // cadencia mínima entre rebalanceos: cada transferencia
+                        // BTC cuesta fee de red real — sin cadencia, un flujo
+                        // unidireccional persistente convierte el fee en sangría
 };
 
 // --- Latencia de red estimada por exchange (ms) para adverse selection ---

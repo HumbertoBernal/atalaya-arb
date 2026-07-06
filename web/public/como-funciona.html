@@ -64,7 +64,7 @@
    ▼                                            ▼
 LiveFeed + L2Feed (cliente) ──► merge (L2 depth / REST) ──► applyChaos() ──► motor
                                                             (escenarios adversos, demo)
-Todo el motor recibe EngineParams — 44 parámetros ajustables en runtime
+Todo el motor recibe EngineParams — 46 parámetros ajustables en runtime
    ├─ detectOpportunities()   cross-exchange, umbral en bps, ranking por neto
    ├─ optimalArb()            tamaño óptimo por profitabilidad marginal
    ├─ frictionCosts()         latencia (adverse selection) + retiro amortizado
@@ -139,7 +139,7 @@ Todo el motor recibe EngineParams — 44 parámetros ajustables en runtime
   <h2>5 · Parametrización: el motor como función de sus supuestos</h2>
   <div class="panel">
     <p style="margin-top:0">El motor son funciones puras que reciben <code>EngineParams</code> —
-      <strong>44 parámetros ajustables en runtime</strong> desde el panel de la UI, sin recargar:
+      <strong>46 parámetros ajustables en runtime</strong> desde el panel de la UI, sin recargar:
       umbral mínimo en bps, tamaño máximo por orden, exchanges activos, fees taker/maker por venue,
       latencia y withdrawal por venue, tolerancia de deriva, límites del circuit breaker, política de
       rebalanceo (mínimos, fee de red, delay de confirmación) y capital inicial.</p>
@@ -169,10 +169,17 @@ Todo el motor recibe EngineParams — 44 parámetros ajustables en runtime
 
   <h2>7 · El hallazgo central</h2>
   <div class="panel">
-    <p style="margin:0">Con fees retail, el arbitraje BTC/USD entre majors es <strong class="rose">estructuralmente
+    <p>Con fees retail, el arbitraje BTC/USD entre majors es <strong class="rose">estructuralmente
       no rentable</strong> (mercados eficientes). El bot lo detecta y <strong>correctamente no opera</strong>.
       A escala HFT (tiers VIP/Maker) los micro-spreads se vuelven capturables. Esa honestidad — no fingir
       alpha — es el diferenciador.</p>
+    <p style="margin-bottom:0">Y el segundo hallazgo, medido con 5 horas de mercado real (ver README):
+      incluso capturando micro-spreads, <strong>el costo realizado de rebalanceo domina</strong>. Cada
+      transferencia on-chain entre venues quema fee de red; un flujo unidireccional persistente convierte
+      el rebalanceo en sangría. En nuestro sweep, el umbral de 5 bps ganó (+$81, cero rebalanceos) y la
+      config agresiva perdió $970 pagando 45 transferencias. Por eso el motor dimensiona por inventario
+      (máx. fracción de wallet por orden), impone cadencia mínima de rebalanceo, y el P&amp;L se muestra
+      descompuesto: <em>ganancia de trading − costos de rebalanceo</em>.</p>
   </div>
 
   <div class="footer">

@@ -35,6 +35,8 @@ export type SessionStats = {
   rebalances: number;
   aborted: number;
   autoRearms: number; // recuperaciones automáticas del breaker (transparencia)
+  tradingPnlUsd: number; // suma de netos de trading (siempre ≥ 0 por diseño)
+  rebalanceCostUsd: number; // fees de red acumulados — P&L = trading − esto
   startTs: number;
 };
 
@@ -48,6 +50,8 @@ export const emptyStats = (startTs = 0): SessionStats => ({
   rebalances: 0,
   aborted: 0,
   autoRearms: 0,
+  tradingPnlUsd: 0,
+  rebalanceCostUsd: 0,
   startTs,
 });
 
@@ -63,6 +67,7 @@ export type SimState = {
   transfers: Transfer[]; // rebalanceos en tránsito (confirmación on-chain)
   consecutiveAborts: number;
   breakerUntil: number; // epoch ms del auto-rearm; 0 = sin cooldown en curso
+  lastRebalanceTs: number; // para la cadencia mínima entre rebalanceos
   trades: Trade[]; // más reciente primero, capped
   stats: SessionStats;
   equity: { t: number; pnl: number }[];
@@ -90,6 +95,7 @@ export function initSimState(p: EngineParams, startTs = 0): SimState {
     transfers: [],
     consecutiveAborts: 0,
     breakerUntil: 0,
+    lastRebalanceTs: 0,
     trades: [],
     stats: emptyStats(startTs),
     equity: [],
@@ -193,13 +199,16 @@ export function stepSession(
 
     // Rebalanceo dirigido si algún venue ACTIVO se agotó y no viene nada en
     // camino: déficits sobre saldos proyectados (real + en tránsito) para no
-    // duplicar envíos; venues desactivados donan pero no reciben.
+    // duplicar envíos; venues desactivados donan pero no reciben. La CADENCIA
+    // mínima acota el costo: cada transferencia BTC quema fee de red real y un
+    // flujo unidireccional persistente convertiría el rebalanceo en sangría.
+    const cadenceOk = now - state.lastRebalanceTs >= p.rebalance.minIntervalSec * 1000;
     const projected = projectWallets(w, state.transfers);
     const activeProjected = Object.fromEntries(
       Object.entries(projected).filter(([ex]) => isActive(p, ex)),
     );
     const refP = referencePrice(merged);
-    if (refP && needsRebalance(activeProjected, p.rebalance)) {
+    if (cadenceOk && refP && needsRebalance(activeProjected, p.rebalance)) {
       const plan = planRebalance(w, refP, p.rebalance, now, {
         projected,
         canReceive: (ex) => isActive(p, ex),
@@ -209,7 +218,9 @@ export function stepSession(
         state.transfers = [...state.transfers, ...plan.transfers];
         walletsTouched = true;
         state.pnl -= plan.costUsd;
+        state.lastRebalanceTs = now;
         state.stats.rebalances += 1;
+        state.stats.rebalanceCostUsd += plan.costUsd;
       }
     }
   } else if (state.pending.length) {
@@ -227,6 +238,7 @@ export function stepSession(
       if (tr.partial) state.stats.partialCount += 1;
       state.stats.volumeBtc += tr.qty;
       state.stats.bestTrade = Math.max(state.stats.bestTrade, tr.netProfit);
+      state.stats.tradingPnlUsd += tr.netProfit;
     }
   }
   if (walletsTouched) state.wallets = w;

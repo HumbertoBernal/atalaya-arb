@@ -25,7 +25,7 @@ en bruto puede ser negativa tras **fees, slippage y liquidez** — y ahí está 
 | Motor cuant | **TypeScript puro** (funciones puras y testeables en `lib/arb/`) |
 | Tiempo real | **WebSocket** (order book L2 + top-of-book) + **REST** (fallback) |
 | Datos de mercado | APIs públicas de **Coinbase, Kraken, Bitstamp, Gemini, Bitfinex** (sin API keys) |
-| Testing | **tsx** + runner propio (`pnpm test`, 87 aserciones deterministas) |
+| Testing | **tsx** + runner propio (`pnpm test`, 94 aserciones deterministas) |
 | Tooling | **pnpm**, **ESLint**, **MathJax** (render de fórmulas) |
 | Deploy | **Vercel** (producción) · **GitHub** (repo) |
 
@@ -42,7 +42,7 @@ L2Feed + LiveFeed (cliente)                 /api/orderbooks · /api/triangular
    │  libro completo + mejor bid/ask                 │  server-side (evita CORS/geo)
    └───────────► merge (L2 válido > WS top > REST) ◄─┘
         ▼            ▼ applyChaos() — escenarios adversos inyectables (demo)
-Cliente (React, ~1.2s + push WS) — todo recibe EngineParams (44 tunables runtime)
+Cliente (React, ~1.2s + push WS) — todo recibe EngineParams (46 tunables runtime)
    ├─ detectOpportunities()  ── cross-exchange ask<bid, umbral en bps, ranking por neto
    ├─ optimalArb()           ── tamaño óptimo por profitabilidad MARGINAL
    │                            (recorre el book → slippage y fills parciales)
@@ -60,7 +60,7 @@ Cliente (React, ~1.2s + push WS) — todo recibe EngineParams (44 tunables runti
 
 ### Capacidades
 
-- **44 parámetros ajustables en runtime** desde la UI (panel "Parámetros del motor"): umbral mínimo
+- **46 parámetros ajustables en runtime** desde la UI (panel "Parámetros del motor"): umbral mínimo
   de rentabilidad en bps, tamaño máximo por orden, exchanges activos (on/off por venue), fees
   taker/maker editables por exchange, latencia y withdrawal por venue, volatilidad para adverse
   selection, tolerancia de deriva pre-ejecución, riesgo (drawdown, staleness, abortos), rebalanceo
@@ -100,7 +100,7 @@ Cliente (React, ~1.2s + push WS) — todo recibe EngineParams (44 tunables runti
 - **Panel de métricas**: latencia de detección p50/p99, throughput WS (msgs/seg), frescura de datos.
 - **Sesión persistente**: P&L, ledger, wallets y transferencias sobreviven recargas (localStorage);
   el ledger se exporta a **CSV**.
-- **Tests**: `pnpm test` (87 aserciones del motor y el simulador, deterministas).
+- **Tests**: `pnpm test` (94 aserciones del motor y el simulador, deterministas).
 
 ### Decisiones técnicas clave
 
@@ -146,7 +146,7 @@ web/src/
   app/page.tsx                  # render del dashboard
   components/arb/
     ArbDashboard.tsx  # UI tiempo real (KPIs, tablas, P&L, ledger, balances)
-    ConfigPanel.tsx   # panel de parametrización (44 tunables en runtime)
+    ConfigPanel.tsx   # panel de parametrización (46 tunables en runtime)
     ChaosPanel.tsx    # inyector de escenarios adversos (demo de robustez)
     LabPanel.tsx      # laboratorio: configs en paralelo sobre el mismo mercado
     DepthChart.tsx    # profundidad acumulada del libro por venue
@@ -166,7 +166,7 @@ web/src/
     stats.ts       # z-score (arbitraje estadístico)
     config.ts      # defaults: exchanges, fees, withdrawal, latencia, riesgo
     types.ts
-scripts/test-engine.ts          # tests unitarios (pnpm test, 87 aserciones)
+scripts/test-engine.ts          # tests unitarios (pnpm test, 94 aserciones)
 scripts/test-arb.ts             # test de humo con order books reales
 scripts/record-tape.ts          # graba una cinta del mercado real (pnpm tape)
 scripts/experiment.ts           # sweep de configs sobre la cinta (pnpm experiment)
@@ -185,7 +185,7 @@ cd atalaya-arb/web
 pnpm install        # instala dependencias
 
 pnpm dev            # desarrollo → http://localhost:3000
-pnpm test           # tests unitarios del motor (87 aserciones)
+pnpm test           # tests unitarios del motor (94 aserciones)
 pnpm build          # build de producción
 pnpm start          # sirve el build de producción
 
@@ -196,9 +196,33 @@ pnpm experiment data/tapes/<cinta>.jsonl --grid   # sweep de configs sobre esa c
 
 No requiere variables de entorno ni API keys: todos los datos son de endpoints públicos.
 
+## Resultados: sweep sobre 5 horas de mercado real
+
+`pnpm tape` grabó **2,966 ticks (~5 h) de order books reales**; `pnpm experiment --grid` replayó
+16 configuraciones contra exactamente los mismos datos (replay determinista). Extracto:
+
+| Config | P&L | Fills | Abortos | Rebalanceos | Max drawdown |
+|---|---:|---:|---:|---:|---:|
+| **Umbral 5 bps** | **+$81.09** | 11 | 77 | 0 | $0 |
+| Preset Conservador | +$62.85 | 15 | 207 | 0 | $0 |
+| Umbral 2 bps | +$48.98 | 40 | 448 | 2 | $56 |
+| Defaults (umbral 0) | +$31.27 | 179 | 544 | 18 | $134 |
+| Umbral 10 bps | $0.00 | 0 | 0 | 0 | $0 |
+| Preset Agresivo | **−$970.63** | 330 | 911 | 45 | $1,045 |
+
+**El hallazgo:** el enemigo del micro-arbitraje no son los fees de trading — es el **costo
+realizado de rebalanceo**. La paciencia gana: pocas operaciones gordas (umbral 5 bps) rinden
+más que 30× el volumen (el Agresivo pierde $970 pagando 45 transferencias on-chain), y
+apretar demasiado (10 bps) significa no operar nunca. Por eso el motor incluye **sizing por
+inventario** (máx. % de wallet por orden) y **cadencia mínima de rebalanceo**, y la UI
+descompone el P&L en *ganancia de trading − costos de rebalanceo* para que se vea a dónde
+va cada dólar.
+
+Reproducible: `pnpm tape 60 && pnpm experiment data/tapes/<cinta>.jsonl --grid`.
+
 ## Qué demuestra (criterios de la fase final)
 
-- **Profundidad y parametrización:** 44 variables controlables en runtime — umbrales, fees, tamaños
+- **Profundidad y parametrización:** 46 variables controlables en runtime — umbrales, fees, tamaños
   de orden, exchanges activos, riesgo, rebalanceo, capital — con presets y persistencia. Y dos formas
   de **comparar configuraciones con evidencia**: el laboratorio en vivo (configs en paralelo sobre el
   mismo mercado) y el sweep reproducible por CLI sobre cintas grabadas.
@@ -213,7 +237,7 @@ No requiere variables de entorno ni API keys: todos los datos son de endpoints p
   real; sesión persistente y export CSV.
 - **Documentación y claridad:** este README, [DEMO.md](DEMO.md), la página
   [Cómo funciona](https://atalaya-arb.vercel.app/como-funciona.html) con la matemática completa, y un
-  motor de funciones puras con 87 aserciones de test.
+  motor de funciones puras con 94 aserciones de test.
 
 ## Limitaciones honestas
 

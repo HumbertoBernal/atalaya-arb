@@ -73,6 +73,9 @@ export function ArbDashboard() {
   const viableCount = e.opps.filter((o) => o.viable).length;
   const totalUsd = Object.values(e.wallets).reduce((s, w) => s + w.usd, 0);
   const totalBtc = Object.values(e.wallets).reduce((s, w) => s + w.btc, 0);
+  // El capital en tránsito (rebalanceos confirmando) no está en las wallets,
+  // pero sigue siendo nuestro — sin sumarlo, el inventario parece "perder" BTC.
+  const transitBtc = e.transfers.filter((t) => t.asset === "btc").reduce((s, t) => s + t.amount, 0);
   const wsLive = Object.values(e.feedStatus).filter((s) => s === "live").length;
   const loading = e.books.length === 0;
   const activeTier = FEE_TIERS.find((t) => Math.abs(t.mult - e.params.feeMult) < 1e-9);
@@ -154,7 +157,10 @@ export function ArbDashboard() {
                 <span className="text-neutral-300 font-mono">{e.session.filledCount}</span> operaciones · {e.session.partialCount} parciales ·{" "}
                 <span className="text-amber-400/90 font-mono">{e.session.aborted}</span> abortadas
               </span>
-              <span><span className="text-neutral-300 font-mono">{fmtNum(totalBtc, 2)}</span> BTC inventario</span>
+              <span>
+                <span className="text-neutral-300 font-mono">{fmtNum(totalBtc, 2)}</span> BTC inventario
+                {transitBtc > 0.0001 && <span className="text-cyan-400/80"> (+{fmtNum(transitBtc, 2)} en tránsito)</span>}
+              </span>
               <span className="capitalize">
                 Modo: {e.params.maker ? "maker" : "taker"} · {activeTier?.label ?? "fees custom"}
                 {e.params.minNetBps > 0 && ` · umbral ${e.params.minNetBps} bps`}
@@ -353,8 +359,9 @@ export function ArbDashboard() {
               <Stat label="Volumen operado" value={`${fmtNum(e.session.volumeBtc, 3)} BTC`} />
               <Stat label="Mejor operación" value={fmtUsd(e.session.bestTrade)} />
               <Stat label="Abortadas (re-check)" value={`${e.session.aborted}`} />
-              <Stat label="Rebalanceos" value={`${e.session.rebalances}`} />
               <Stat label="Auto re-arms del breaker" value={`${e.session.autoRearms}`} />
+              <Stat label="Ganancia de trading" value={fmtUsd(e.session.tradingPnlUsd)} />
+              <Stat label={`Rebalanceos (${e.session.rebalances}) — costo`} value={`−${fmtUsd(e.session.rebalanceCostUsd)}`} />
             </div>
           </Panel>
 

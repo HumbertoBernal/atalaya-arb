@@ -183,16 +183,21 @@ export function simulateExecution(
   let qty = liq.qty;
   if (qty <= EPS) return { trade: null, wallets };
 
-  // Restricción de USD en buyEx: gasto = buyCost*(1+fee). Limitar qty proporcional.
-  const maxByUsd = (buyW.usd / (liq.avgBuy * (1 + buyFee))) || 0;
-  // Restricción de BTC en sellEx.
-  const maxByBtc = sellW.btc;
+  // Restricción por SALDO con sizing por inventario: una orden solo puede usar
+  // maxWalletFrac de la wallet del venue. Sin este tope, una orden grande drena
+  // el venue de golpe → rebalanceo inmediato → el fee de red se come el edge.
+  const frac = Math.min(1, Math.max(0.01, p.maxWalletFrac));
+  const fullByUsd = (buyW.usd / (liq.avgBuy * (1 + buyFee))) || 0;
+  const fullByBtc = sellW.btc;
   const requested = qty;
-  qty = Math.min(qty, maxByUsd, maxByBtc);
+  qty = Math.min(qty, fullByUsd * frac, fullByBtc * frac);
   // Modo maker: la orden límite solo se llena con cierta probabilidad antes de
   // que el spread se cierre → el volumen esperado ejecutado es menor.
   if (p.maker) qty *= p.makerFillProb;
   if (qty <= EPS) return { trade: null, wallets };
+  // "Parcial" = el SALDO del venue no alcanzó para lo deseado. El recorte por
+  // sizing (frac) o por probabilidad maker es política deliberada, no parcial.
+  const balanceBound = Math.min(fullByUsd, fullByBtc) < requested - EPS;
 
   // Re-walk para la qty final (precios promedio reales con slippage).
   const exec = optimalArb(books[opp.buyEx].asks, books[opp.sellEx].bids, buyFee, sellFee, qty);
@@ -235,7 +240,7 @@ export function simulateExecution(
     sellFee: sellFeeUsd,
     grossProfit,
     netProfit,
-    partial: exec.qty < requested - EPS,
+    partial: balanceBound,
     status: "filled",
   };
 
