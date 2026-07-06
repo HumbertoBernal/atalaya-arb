@@ -42,7 +42,7 @@ L2Feed + LiveFeed (cliente)                 /api/orderbooks · /api/triangular
    │  libro completo + mejor bid/ask                 │  server-side (evita CORS/geo)
    └───────────► merge (L2 válido > WS top > REST) ◄─┘
         ▼            ▼ applyChaos() — escenarios adversos inyectables (demo)
-Cliente (React, ~1.2s + push WS) — todo recibe EngineParams (43 tunables runtime)
+Cliente (React, ~1.2s + push WS) — todo recibe EngineParams (44 tunables runtime)
    ├─ detectOpportunities()  ── cross-exchange ask<bid, umbral en bps, ranking por neto
    ├─ optimalArb()           ── tamaño óptimo por profitabilidad MARGINAL
    │                            (recorre el book → slippage y fills parciales)
@@ -60,7 +60,7 @@ Cliente (React, ~1.2s + push WS) — todo recibe EngineParams (43 tunables runti
 
 ### Capacidades
 
-- **43 parámetros ajustables en runtime** desde la UI (panel "Parámetros del motor"): umbral mínimo
+- **44 parámetros ajustables en runtime** desde la UI (panel "Parámetros del motor"): umbral mínimo
   de rentabilidad en bps, tamaño máximo por orden, exchanges activos (on/off por venue), fees
   taker/maker editables por exchange, latencia y withdrawal por venue, volatilidad para adverse
   selection, tolerancia de deriva pre-ejecución, riesgo (drawdown, staleness, abortos), rebalanceo
@@ -80,7 +80,14 @@ Cliente (React, ~1.2s + push WS) — todo recibe EngineParams (43 tunables runti
 - **Cálculo neto completo**: fees por exchange + slippage (order book real) + **adverse selection
   por latencia de red** + **withdrawal fee amortizado** (rebalanceo).
 - **Circuit breaker**: detiene la ejecución ante datos stale, spread anómalo (dato corrupto), drawdown
-  o **N ejecuciones abortadas seguidas** (mercado más rápido que la ejecución), con re-armado manual.
+  o **N ejecuciones abortadas seguidas** (mercado más rápido que la ejecución). Se **re-arma solo**
+  tras un cooldown configurable (racha a cero, pico = P&L actual) o manualmente con un clic.
+- **Laboratorio de experimentos**: hasta 4 configuraciones (presets + la tuya) corren **en paralelo
+  sobre el mismo mercado en vivo**, cada una con wallets, breaker y rebalanceos independientes —
+  tabla comparativa y P&L superpuesto para ver los trade-offs con evidencia, no con opiniones.
+- **Sweep reproducible por CLI**: `pnpm tape 15` graba una cinta del mercado real (JSONL) y
+  `pnpm experiment <cinta> --grid` replaya una grilla de configuraciones contra **exactamente los
+  mismos ticks** — comparación determinista que justifica los defaults del motor.
 - **Rebalanceo dirigido de inventario**: cuando un venue cae bajo el mínimo, el más sobrado le
   transfiere; el BTC paga fee de red y **tarda en confirmar** — mientras viaja no está disponible
   (visible como "en tránsito" en la UI).
@@ -91,7 +98,7 @@ Cliente (React, ~1.2s + push WS) — todo recibe EngineParams (43 tunables runti
 - **Panel de métricas**: latencia de detección p50/p99, throughput WS (msgs/seg), frescura de datos.
 - **Sesión persistente**: P&L, ledger, wallets y transferencias sobreviven recargas (localStorage);
   el ledger se exporta a **CSV**.
-- **Tests**: `pnpm test` (65 aserciones del motor, deterministas).
+- **Tests**: `pnpm test` (81 aserciones del motor y el simulador, deterministas).
 
 ### Decisiones técnicas clave
 
@@ -115,9 +122,13 @@ Cliente (React, ~1.2s + push WS) — todo recibe EngineParams (43 tunables runti
   venue). Con fees retail el arbitraje BTC/USD casi nunca es neto-positivo (mercados eficientes); a
   fees HFT aparecen ejecuciones — exactamente por qué el arbitraje real es un juego de baja latencia.
 - **Gestión de riesgo.** Tope de notional por operación, fills parciales por liquidez y por saldo de
-  wallet, rechazo de no rentables, y circuit breaker de 4 condiciones con re-armado manual.
+  wallet, rechazo de no rentables, y circuit breaker de 4 condiciones con cooldown auto-rearm.
 - **Rebalanceo con física real.** Transferir BTC entre exchanges no es gratis ni instantáneo: las
   transferencias dirigidas pagan fee de red y confirman con delay; el capital en tránsito no opera.
+- **Un solo simulador, tres consumidores.** Toda la lógica del tick vive en `lib/arb/simulator.ts`
+  (función pura `stepSession`): la usan el dashboard, el laboratorio de configs en paralelo y el
+  sweep por CLI. Cero duplicación — lo que ves en la demo es exactamente lo que corren los tests
+  y los experimentos.
 
 ## Exchanges y fees
 
@@ -133,29 +144,33 @@ web/src/
   app/page.tsx                  # render del dashboard
   components/arb/
     ArbDashboard.tsx  # UI tiempo real (KPIs, tablas, P&L, ledger, balances)
-    ConfigPanel.tsx   # panel de parametrización (43 tunables en runtime)
+    ConfigPanel.tsx   # panel de parametrización (44 tunables en runtime)
     ChaosPanel.tsx    # inyector de escenarios adversos (demo de robustez)
+    LabPanel.tsx      # laboratorio: configs en paralelo sobre el mismo mercado
     DepthChart.tsx    # profundidad acumulada del libro por venue
     SpreadMatrix.tsx  # heatmap exchange × exchange
-    useArbEngine.ts   # orquestador: feeds, tick, dos fases, persistencia
+    useArbEngine.ts   # orquestador: feeds, ticks del simulador, persistencia
   lib/arb/
     exchanges.ts   # conectores REST + normalización
     livefeed.ts    # feeds WebSocket top-of-book (cliente) + reconexión
     l2book.ts      # order book L2 completo por WebSocket (snapshot + deltas)
-    engine.ts      # detección, optimalArb, fricción, re-check, simulación (puro)
+    engine.ts      # detección, optimalArb, fricción, re-check, ejecución (puro)
+    simulator.ts   # stepSession: el tick completo como función pura (núcleo común)
     params.ts      # EngineParams: tunables runtime + presets + merge persistido
     chaos.ts       # escenarios adversos inyectables (capa de simulación)
-    risk.ts        # circuit breaker (4 condiciones)
+    risk.ts        # circuit breaker (4 condiciones + cooldown)
     triangular.ts  # arbitraje triangular intra-exchange
     rebalance.ts   # rebalanceo dirigido + transferencias con delay on-chain
     stats.ts       # z-score (arbitraje estadístico)
     config.ts      # defaults: exchanges, fees, withdrawal, latencia, riesgo
     types.ts
-scripts/test-engine.ts          # tests unitarios (pnpm test, 65 aserciones)
+scripts/test-engine.ts          # tests unitarios (pnpm test, 81 aserciones)
 scripts/test-arb.ts             # test de humo con order books reales
+scripts/record-tape.ts          # graba una cinta del mercado real (pnpm tape)
+scripts/experiment.ts           # sweep de configs sobre la cinta (pnpm experiment)
 ```
 
-Ver **[DEMO.md](DEMO.md)** para el guion de demo de 90s orientado al jurado.
+Ver **[DEMO.md](DEMO.md)** para el guion de demo de ~2 min orientado al jurado.
 
 ## Instalación y ejecución
 
@@ -168,17 +183,23 @@ cd atalaya-arb/web
 pnpm install        # instala dependencias
 
 pnpm dev            # desarrollo → http://localhost:3000
-pnpm test           # tests unitarios del motor (65 aserciones)
+pnpm test           # tests unitarios del motor (81 aserciones)
 pnpm build          # build de producción
 pnpm start          # sirve el build de producción
+
+# Experimentos reproducibles (¿qué configuración funciona mejor?)
+pnpm tape 15                              # graba 15 min de mercado real → JSONL
+pnpm experiment data/tapes/<cinta>.jsonl --grid   # sweep de configs sobre esa cinta
 ```
 
 No requiere variables de entorno ni API keys: todos los datos son de endpoints públicos.
 
 ## Qué demuestra (criterios de la fase final)
 
-- **Profundidad y parametrización:** 43 variables controlables en runtime — umbrales, fees, tamaños
-  de orden, exchanges activos, riesgo, rebalanceo, capital — con presets y persistencia.
+- **Profundidad y parametrización:** 44 variables controlables en runtime — umbrales, fees, tamaños
+  de orden, exchanges activos, riesgo, rebalanceo, capital — con presets y persistencia. Y dos formas
+  de **comparar configuraciones con evidencia**: el laboratorio en vivo (configs en paralelo sobre el
+  mismo mercado) y el sweep reproducible por CLI sobre cintas grabadas.
 - **Robustez ante escenarios adversos:** órdenes que fallan (abortos por deriva, visibles y con
   motivo), liquidez insuficiente (fills parciales por libro y por saldo), mercado moviéndose durante
   la ejecución (re-verificación en dos fases), venue caído (fallback WS→REST), datos corruptos o
@@ -190,7 +211,7 @@ No requiere variables de entorno ni API keys: todos los datos son de endpoints p
   real; sesión persistente y export CSV.
 - **Documentación y claridad:** este README, [DEMO.md](DEMO.md), la página
   [Cómo funciona](https://atalaya-arb.vercel.app/como-funciona.html) con la matemática completa, y un
-  motor de funciones puras con 65 aserciones de test.
+  motor de funciones puras con 81 aserciones de test.
 
 ## Limitaciones honestas
 

@@ -89,8 +89,9 @@ export const BTC_VOL_PER_SEC = 0.00012; // ~0.012%/s (≈ 60% anualizado)
 export const RISK = {
   maxBookAgeMs: 6000,        // datos más viejos que esto = stale → halt
   maxGrossBps: 150,          // spread bruto > esto = probable dato corrupto → ignorar
-  maxConsecutiveLosses: 3,   // (en sim no debería pasar; defensivo)
+  maxConsecutiveLosses: 3,   // abortos de ejecución seguidos que disparan halt
   maxDrawdownUsd: 5000,      // caída desde el pico de P&L que dispara halt
+  cooldownSec: 30,           // tras un halt, re-armado automático (0 = solo manual)
 };
 
 // --- Pares para arbitraje triangular (intra-exchange) ---

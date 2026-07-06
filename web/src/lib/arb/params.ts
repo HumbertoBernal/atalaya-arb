@@ -23,6 +23,7 @@ export type RiskParams = {
   maxGrossBps: number; // spread bruto mayor = probable dato corrupto → ignorar
   maxConsecutiveLosses: number; // abortos de ejecución seguidos que disparan halt
   maxDrawdownUsd: number; // caída desde el pico de P&L que dispara halt
+  cooldownSec: number; // tras un halt, re-armado automático (0 = solo manual)
 };
 
 export type RebalanceParams = {
