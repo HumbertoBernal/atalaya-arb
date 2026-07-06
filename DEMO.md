@@ -16,10 +16,10 @@ Demo de ~2 minutos, pensada para un jurado técnico. Cada paso indica **qué dec
 Abre la URL. Señala que ya está corriendo en vivo (no es un video). Si aparece el badge
 "Sesión restaurada", menciónalo: el estado sobrevive recargas.
 
-## 1 · Parametrización — 44 variables en runtime (25s) · *criterio: profundidad y parametrización*
+## 1 · Parametrización — 46 variables en runtime (25s) · *criterio: profundidad y parametrización*
 - Abre el panel **"Parámetros del motor"**. Recorre los grupos: estrategia, exchanges activos,
   fees por venue, riesgo, rebalanceo, capital.
-  > "Todo el motor recibe estos parámetros por inyección — 44 variables ajustables sin recargar."
+  > "Todo el motor recibe estos parámetros por inyección — 46 variables ajustables sin recargar."
 - Sube el **umbral mínimo a 5 bps** → en la tabla de oportunidades aparecen filas "bajo umbral":
   netas positivas que el bot ahora rechaza por política.
 - Apaga un exchange (p. ej. Bitfinex) → desaparece del universo de detección al instante.
@@ -65,7 +65,7 @@ Abre la URL. Señala que ya está corriendo en vivo (no es un video). Si aparece
 
 ## 7 · Cierre — código y honestidad (5s) · *criterio: documentación y claridad*
 > "Todo es TypeScript tipado, con un solo simulador puro que comparten el dashboard, el laboratorio
-> y los experimentos por CLI — `pnpm test`, 87 aserciones. Y lo más importante: es **honesto**.
+> y los experimentos por CLI — `pnpm test`, 94 aserciones. Y lo más importante: es **honesto**.
 > No promete alpha que no existe; demuestra exactamente dónde y por qué el arbitraje funciona,
 > y qué lo mata."
 
@@ -86,6 +86,10 @@ Abre la URL. Señala que ya está corriendo en vivo (no es un video). Si aparece
   aborta. Además el costo esperado de adverse selection por latencia se descuenta siempre.
 - **"¿Y los costos de retiro / latencia?"** → Modelados: adverse selection por latencia de red
   (1σ) + withdrawal fee amortizado + fee de red y delay en cada rebalanceo.
+- **"¿Cuál es la mejor configuración?"** → Medido con 5 h de mercado real (tabla en el README):
+  umbral 5 bps ganó (+$81, cero rebalanceos); la agresiva perdió $970 pagando 45 transferencias.
+  El hallazgo: el costo realizado de rebalanceo domina al micro-edge — por eso existen el sizing
+  por inventario y la cadencia mínima, y el P&L se muestra descompuesto en la analítica.
 - **"¿Qué pasa si un exchange se cae?"** → Pruébalo en vivo con el modo caos: fallback a REST,
   y si todo queda stale, el circuit breaker detiene la ejecución.
 

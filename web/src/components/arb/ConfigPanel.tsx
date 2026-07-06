@@ -95,6 +95,16 @@ export function ConfigPanel({ params, patchParams, applyPreset, resetParams }: P
               tip="Tope de volumen por operación — control de riesgo básico."
             />
             <Num
+              label="Máx. % de wallet por orden"
+              suffix="%"
+              value={params.maxWalletFrac * 100}
+              step={5}
+              min={1}
+              max={100}
+              onChange={(v) => patchParams({ maxWalletFrac: Math.min(1, v / 100) })}
+              tip="Sizing por inventario: una orden no puede usar más que esta fracción de la wallet del venue. Evita drenar un venue de golpe y rebalancear a cada rato (los fees de red se comen el edge)."
+            />
+            <Num
               label="Tolerancia de deriva"
               suffix="bps"
               value={params.recheckTolBps}
@@ -271,6 +281,15 @@ export function ConfigPanel({ params, patchParams, applyPreset, resetParams }: P
               min={0}
               onChange={(v) => patchParams({ rebalance: { ...params.rebalance, transferDelaySec: v } })}
               tip="Mientras la transferencia confirma, esos fondos NO están disponibles para operar (escala de demo)."
+            />
+            <Num
+              label="Cadencia mínima"
+              suffix="s"
+              value={params.rebalance.minIntervalSec}
+              step={15}
+              min={0}
+              onChange={(v) => patchParams({ rebalance: { ...params.rebalance, minIntervalSec: Math.max(0, Math.round(v)) } })}
+              tip="Tiempo mínimo entre rebalanceos. Cada transferencia BTC quema fee de red — sin cadencia, un flujo unidireccional persistente convierte el rebalanceo en sangría de P&L."
             />
           </Group>
 

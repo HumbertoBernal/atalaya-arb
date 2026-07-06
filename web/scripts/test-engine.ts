@@ -155,7 +155,7 @@ console.log("stats:");
 
 console.log("rebalance dirigido:");
 {
-  const cfg = { minUsd: 5000, minBtc: 0.1, btcNetworkFee: 0.0003, transferDelaySec: 0 };
+  const cfg = { minUsd: 5000, minBtc: 0.1, btcNetworkFee: 0.0003, transferDelaySec: 0, minIntervalSec: 0 };
   const wallets: Record<string, Wallet> = {
     a: { exchange: "a", usd: 0, btc: 4 },
     b: { exchange: "b", usd: 100000, btc: 0 },
@@ -237,6 +237,11 @@ console.log("simulateExecution:");
   const taker = simulateExecution(viable, books, wallets, P()).trade!;
   const maker = simulateExecution(viable, books, wallets, P({ maker: true, makerFillProb: 0.5 })).trade!;
   check("maker fill prob 0.5 → mitad del volumen", approx(maker.qty, taker.qty * 0.5, 1e-6));
+  // Sizing por inventario: la orden no puede usar más que maxWalletFrac del venue.
+  const sized = simulateExecution(viable, books, wallets, P({ maxWalletFrac: 0.2, maxTradeBtc: 100 })).trade!;
+  check("sizing: la orden respeta el 20% del BTC del venue", sized.qty <= 5 * 0.2 + 1e-9);
+  const full = simulateExecution(viable, books, wallets, P({ maxWalletFrac: 1, maxTradeBtc: 100 })).trade!;
+  check("sizing al 100% permite volumen mayor", full.qty > sized.qty);
 }
 
 console.log("re-verificación (dos fases):");
@@ -334,6 +339,37 @@ console.log("simulador (stepSession):");
     check("BTC total se conserva", approx(r2.state.wallets.a.btc + r2.state.wallets.b.btc, 10));
     check("equity registra el tick", r2.state.equity.length === 2);
     check("no muta el estado previo", r1.state.stats.filledCount === 0);
+    check(
+      "descomposición: P&L = trading − costos de rebalanceo",
+      approx(r2.state.pnl, r2.state.stats.tradingPnlUsd - r2.state.stats.rebalanceCostUsd, 1e-9),
+    );
+  }
+
+  // Cadencia de rebalanceo: un segundo déficit dentro del intervalo espera.
+  {
+    const p = P({
+      rebalance: { minUsd: 90_000, minBtc: 0.1, btcNetworkFee: 0.0003, transferDelaySec: 3600, minIntervalSec: 300 },
+    });
+    const drained: Record<string, Wallet> = {
+      a: { exchange: "a", usd: 1_000, btc: 2 },
+      b: { exchange: "b", usd: 200_000, btc: 2 },
+    };
+    const st: SimState = { ...initSimState(p, 0), wallets: drained };
+    const t1 = mkBooks(1_000_000);
+    const r1 = stepSession(st, t1.map, t1.merged, p, 1_000_000, true);
+    check("primer déficit → rebalancea", r1.state.stats.rebalances === 1);
+    // Nuevo déficit (BTC de b se drenó por trading) dentro del intervalo:
+    const drainedAgain: SimState = {
+      ...r1.state,
+      wallets: { ...r1.state.wallets, b: { ...r1.state.wallets.b, btc: 0.01 } },
+    };
+    const t2 = mkBooks(1_001_200);
+    const r2 = stepSession(drainedAgain, t2.map, t2.merged, p, 1_001_200, true);
+    check("dentro de la cadencia → NO rebalancea otra vez", r2.state.stats.rebalances === 1);
+    const t3 = mkBooks(1_000_000 + 301_000);
+    const r3 = stepSession(r2.state, t3.map, t3.merged, p, 1_000_000 + 301_000, true);
+    check("cumplida la cadencia → rebalancea el déficit pendiente", r3.state.stats.rebalances === 2);
+    check("los costos quedan contados", r3.state.stats.rebalanceCostUsd > 0);
   }
 
   // Spread cerrado en el tick 2 → aborto visible y racha de abortos.

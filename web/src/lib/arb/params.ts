@@ -10,6 +10,7 @@ import {
   MAKER_FEE,
   MAKER_FILL_PROB,
   MAX_TRADE_BTC,
+  MAX_WALLET_FRAC,
   NETWORK_LATENCY_MS,
   REBALANCE,
   REBALANCE_EVERY,
@@ -31,12 +32,14 @@ export type RebalanceParams = {
   minBtc: number; // BTC mínimo por venue antes de rebalancear
   btcNetworkFee: number; // fee de red por transferencia BTC entre venues
   transferDelaySec: number; // confirmación on-chain simulada (0 = instantáneo)
+  minIntervalSec: number; // cadencia mínima entre rebalanceos (control de fees)
 };
 
 export type EngineParams = {
   // --- Estrategia ---
   minNetBps: number; // umbral mínimo de margen neto (bps) para ejecutar
   maxTradeBtc: number; // tope de BTC por operación
+  maxWalletFrac: number; // fracción máx. de la wallet del venue por orden (sizing por inventario)
   feeMult: number; // multiplicador de tier (1 retail … 0 maker-cero)
   maker: boolean; // órdenes límite (fee menor, fill incierto) vs taker
   makerFillProb: number; // probabilidad de fill de una orden límite
@@ -63,6 +66,7 @@ export type EngineParams = {
 export const DEFAULT_PARAMS: EngineParams = {
   minNetBps: 0,
   maxTradeBtc: MAX_TRADE_BTC,
+  maxWalletFrac: MAX_WALLET_FRAC,
   feeMult: 0.1, // tier VIP por defecto (igual que el default previo de la UI)
   maker: false,
   makerFillProb: MAKER_FILL_PROB,
@@ -108,6 +112,7 @@ export const PRESETS: { id: PresetId; label: string; hint: string; apply: (p: En
       ...p,
       minNetBps: 5,
       maxTradeBtc: 0.5,
+      maxWalletFrac: 0.15,
       recheckTolBps: 2,
       risk: { ...p.risk, maxDrawdownUsd: 1500, maxConsecutiveLosses: 2 },
     }),
@@ -120,6 +125,7 @@ export const PRESETS: { id: PresetId; label: string; hint: string; apply: (p: En
       ...p,
       minNetBps: DEFAULT_PARAMS.minNetBps,
       maxTradeBtc: DEFAULT_PARAMS.maxTradeBtc,
+      maxWalletFrac: DEFAULT_PARAMS.maxWalletFrac,
       recheckTolBps: DEFAULT_PARAMS.recheckTolBps,
       risk: { ...DEFAULT_PARAMS.risk },
     }),
@@ -132,6 +138,7 @@ export const PRESETS: { id: PresetId; label: string; hint: string; apply: (p: En
       ...p,
       minNetBps: 0,
       maxTradeBtc: 4,
+      maxWalletFrac: 0.5,
       recheckTolBps: 12,
       risk: { ...p.risk, maxDrawdownUsd: 12000, maxConsecutiveLosses: 5 },
     }),
