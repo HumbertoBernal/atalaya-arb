@@ -366,6 +366,24 @@ console.log("simulador (stepSession):");
     const r4 = stepSession(r3.state, t4.map, t4.merged, p, 14_000, true); // pasado el cooldown
     check("auto-rearm: el bot se recupera solo", !r4.risk.tripped && r4.state.consecutiveAborts === 0);
     check("tras el rearm vuelve a crear pendientes", r4.state.pending.length === 1);
+    check("el auto-rearm queda contado (transparencia)", r4.state.stats.autoRearms === 1);
+    check("el auto-rearm suave NO toca el pico de P&L", r4.state.peakPnl === r3.state.peakPnl);
+  }
+
+  // Drawdown es un trip DURO: nunca se auto-rearma — solo intervención manual.
+  {
+    const p = P({ risk: { ...freshDefaults().risk, maxDrawdownUsd: 100, cooldownSec: 10 } });
+    const st: SimState = { ...initSimState(p, 1000), wallets: wallets2(), pnl: -500, peakPnl: 0 };
+    const t1 = mkBooks(1000);
+    const r1 = stepSession(st, t1.map, t1.merged, p, 1000, true);
+    check("drawdown sobre el límite → trip duro", r1.risk.tripped && r1.risk.hard);
+    check("trip duro no programa cooldown", r1.state.breakerUntil === 0);
+    const t2 = mkBooks(120_000);
+    const r2 = stepSession(r1.state, t2.map, t2.merged, p, 120_000, true);
+    check("sigue detenido mucho después (sin auto-rearm)", r2.risk.tripped && r2.state.stats.autoRearms === 0);
+    const t3 = mkBooks(121_200);
+    const r3 = stepSession(rearm(r2.state), t3.map, t3.merged, p, 121_200, true);
+    check("el re-armado manual sí lo levanta", !r3.risk.tripped);
   }
 
   // Re-armado manual.

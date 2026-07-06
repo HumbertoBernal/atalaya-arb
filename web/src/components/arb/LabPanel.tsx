@@ -73,6 +73,7 @@ export function LabPanel({ lab, nowTs, startLab, stopLab, clearLab }: Props) {
                       key={c.id}
                       onClick={() => toggle(c.id)}
                       title={c.hint}
+                      aria-pressed={on}
                       className={`px-3 py-1.5 rounded-full border text-sm transition-colors ${
                         on ? "bg-neutral-800 text-neutral-100" : "text-neutral-500 hover:border-neutral-500"
                       }`}
@@ -100,6 +101,12 @@ export function LabPanel({ lab, nowTs, startLab, stopLab, clearLab }: Props) {
               <div className="flex flex-wrap items-center gap-3 text-xs text-neutral-400">
                 <span className="font-mono">
                   {lab.active ? "⏱" : "⏸"} {nowTs && lab.startTs ? fmtDuration(nowTs - lab.startTs) : "—"} · {lab.ticks} ticks
+                </span>
+                <span
+                  className="text-neutral-600"
+                  title="El experimento es independiente del motor primario: sigue corriendo aunque pauses, y Reset no lo toca."
+                >
+                  ⓘ independiente del motor
                 </span>
                 {lab.active ? (
                   <button onClick={stopLab} className="px-2.5 py-1 rounded-lg border border-neutral-700 text-neutral-300 hover:border-amber-500 hover:text-amber-300 transition-colors">
@@ -148,8 +155,12 @@ export function LabPanel({ lab, nowTs, startLab, stopLab, clearLab }: Props) {
                           <td className="text-right font-mono text-neutral-400">{r.rebalances}</td>
                           <td className="text-right">
                             {r.breaker === "ok" && <span className="text-emerald-400 text-xs">● ok</span>}
-                            {r.breaker === "cooldown" && <span className="text-amber-400 text-xs">◐ cooldown</span>}
-                            {r.breaker === "halt" && <span className="text-rose-400 text-xs">■ halt</span>}
+                            {r.breaker === "cooldown" && (
+                              <span className="text-amber-400 text-xs" title="Trip operativo: esta config se re-arma sola al cumplir su cooldown.">◐ cooldown</span>
+                            )}
+                            {r.breaker === "halt" && (
+                              <span className="text-rose-400 text-xs" title="Detenida de forma permanente (límite de pérdida o cooldown en 0). Eso también es un resultado del experimento: esta config no sobrevivió.">■ halt</span>
+                            )}
                           </td>
                         </tr>
                       ))}

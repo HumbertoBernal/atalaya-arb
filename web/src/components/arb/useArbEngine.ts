@@ -148,7 +148,7 @@ export function useArbEngine() {
   const [serverLatency, setServerLatency] = useState(0);
   const [tickCount, setTickCount] = useState(0);
   const [feedStatus, setFeedStatus] = useState<Record<string, FeedStatus>>({});
-  const [risk, setRisk] = useState<RiskState>({ tripped: false, reasons: [], maxBookAgeMs: 0 });
+  const [risk, setRisk] = useState<RiskState>({ tripped: false, hard: false, reasons: [], maxBookAgeMs: 0 });
   const [breakerUntil, setBreakerUntil] = useState(0);
   const [tri, setTri] = useState<{ results: TriResult[]; ts: number } | null>(null);
   const [metrics, setMetrics] = useState<Metrics>({ detP50: 0, detP99: 0, wsRate: 0, freshnessMs: 0 });
@@ -190,6 +190,9 @@ export function useArbEngine() {
 
       let sessionRestored = false;
       try {
+        // Migración: snapshots de esquemas previos quedarían huérfanos para siempre.
+        window.localStorage.removeItem("atalaya.session.v1");
+        window.localStorage.removeItem("atalaya.session.v2");
         const raw = window.localStorage.getItem(SESSION_KEY);
         if (raw) {
           const saved = JSON.parse(raw) as SavedSession;
@@ -425,9 +428,13 @@ export function useArbEngine() {
 
   // --- Laboratorio de experimentos ---
   const startLab = useCallback((ids: LabConfigId[]) => {
+    // Defensa en profundidad (la UI ya lo garantiza): sin duplicados, ids
+    // conocidos, y mínimo 2 configs para que comparar tenga sentido.
+    const valid = [...new Set(ids)].filter((id) => id === "actual" || PRESETS.some((x) => x.id === id));
+    if (valid.length < 2) return;
     const now = Date.now();
     const current = paramsRef.current;
-    const runs: LabRun[] = ids.map((id) => {
+    const runs: LabRun[] = valid.map((id) => {
       const preset = PRESETS.find((x) => x.id === id);
       // Presets se aplican sobre TU config actual: mismo tier/fees/venues en
       // todas las corridas — solo difieren los knobs de estrategia (comparación justa).
@@ -533,7 +540,7 @@ function labViewOf(lab: LabInternal, now: number): LabView {
       viableSeen: run.state.stats.viableSeen,
       volumeBtc: run.state.stats.volumeBtc,
       rebalances: run.state.stats.rebalances,
-      breaker: run.risk?.tripped ? (run.state.breakerUntil > now ? "cooldown" : "halt") : "ok",
+      breaker: run.risk?.tripped ? (run.state.breakerUntil >= now ? "cooldown" : "halt") : "ok",
     })),
   };
 }

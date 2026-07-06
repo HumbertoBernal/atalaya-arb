@@ -65,7 +65,7 @@ Abre la URL. Señala que ya está corriendo en vivo (no es un video). Si aparece
 
 ## 7 · Cierre — código y honestidad (5s) · *criterio: documentación y claridad*
 > "Todo es TypeScript tipado, con un solo simulador puro que comparten el dashboard, el laboratorio
-> y los experimentos por CLI — `pnpm test`, 81 aserciones. Y lo más importante: es **honesto**.
+> y los experimentos por CLI — `pnpm test`, 87 aserciones. Y lo más importante: es **honesto**.
 > No promete alpha que no existe; demuestra exactamente dónde y por qué el arbitraje funciona,
 > y qué lo mata."
 

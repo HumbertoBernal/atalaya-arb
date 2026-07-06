@@ -34,6 +34,7 @@ export type SessionStats = {
   bestTrade: number;
   rebalances: number;
   aborted: number;
+  autoRearms: number; // recuperaciones automáticas del breaker (transparencia)
   startTs: number;
 };
 
@@ -46,6 +47,7 @@ export const emptyStats = (startTs = 0): SessionStats => ({
   bestTrade: 0,
   rebalances: 0,
   aborted: 0,
+  autoRearms: 0,
   startTs,
 });
 
@@ -94,14 +96,17 @@ export function initSimState(p: EngineParams, startTs = 0): SimState {
   };
 }
 
-/** Re-armado del breaker: resetea la racha de abortos y toma el P&L actual
- *  como nuevo pico (presupuesto de drawdown fresco). Lo usan el botón manual
- *  y el auto-rearm por cooldown. */
+/** Re-armado MANUAL del breaker: resetea la racha de abortos y toma el P&L
+ *  actual como nuevo pico (presupuesto de drawdown fresco). Es la única vía
+ *  para levantar un trip por drawdown — los límites de pérdida son duros. */
 export function rearm(state: SimState): SimState {
   return { ...state, consecutiveAborts: 0, peakPnl: state.pnl, breakerUntil: 0 };
 }
 
-/** Avanza la sesión un tick sobre los libros dados. Puro: no muta `prev`. */
+/**
+ * Avanza la sesión un tick sobre los libros dados. No muta `prev`; la economía
+ * del replay es determinista (los `now` se inyectan hasta el ledger).
+ */
 export function stepSession(
   prev: SimState,
   map: OrderBooks,
@@ -110,7 +115,7 @@ export function stepSession(
   now: number,
   running = true,
 ): StepResult {
-  let state: SimState = { ...prev, stats: { ...prev.stats } };
+  const state: SimState = { ...prev, stats: { ...prev.stats } };
 
   // Detección sobre el universo activo de ESTA config.
   const detectedRaw = detectOpportunities(map, p);
@@ -118,18 +123,22 @@ export function stepSession(
   state.stats.oppsSeen += detectedRaw.length;
   state.stats.viableSeen += detected.filter((o) => o.viable).length;
 
-  // Auto-rearm: cumplido el cooldown, el bot se recupera solo (racha a cero,
-  // pico = P&L actual). Si el mercado sigue hostil, volverá a dispararse.
+  // Auto-rearm SUAVE: cumplido el cooldown, la racha de abortos se limpia y el
+  // bot reintenta. El pico de P&L NO se toca — el trip duro (drawdown) solo se
+  // levanta con re-armado manual, como corresponde a un límite de pérdida.
   if (state.breakerUntil > 0 && now >= state.breakerUntil) {
-    state = rearm(state);
+    state.consecutiveAborts = 0;
+    state.breakerUntil = 0;
+    state.stats.autoRearms += 1;
   }
 
   // Circuit breaker (incluye la racha de abortos de ticks anteriores).
   const risk = evaluateRisk(merged, detectedRaw, state.pnl, state.peakPnl, now, p.risk, state.consecutiveAborts);
-  if (risk.tripped && state.breakerUntil === 0 && p.risk.cooldownSec > 0) {
+  if (risk.tripped && !risk.hard && state.breakerUntil === 0 && p.risk.cooldownSec > 0) {
+    // Solo los trips OPERATIVOS (stale/anómalo/abortos) programan cooldown.
     state.breakerUntil = now + p.risk.cooldownSec * 1000;
   }
-  if (!risk.tripped) state.breakerUntil = 0;
+  if (!risk.tripped || risk.hard) state.breakerUntil = 0;
 
   let w = state.wallets;
   let walletsTouched = false;
@@ -155,7 +164,7 @@ export function stepSession(
       if (!isActive(p, po.opp.buyEx) || !isActive(p, po.opp.sellEx)) continue;
       const rc = recheckOpportunity(po.opp, map, p);
       if (rc.ok && rc.fresh) {
-        const { trade, wallets: nextW } = simulateExecution(rc.fresh, map, w, p);
+        const { trade, wallets: nextW } = simulateExecution(rc.fresh, map, w, p, now);
         if (trade) {
           trade.driftBps = rc.driftBps;
           w = nextW;
@@ -165,9 +174,9 @@ export function stepSession(
           state.consecutiveAborts = 0;
           continue;
         }
-        newTrades.push(abortedTrade(po.opp, "liquidez o saldo insuficiente al ejecutar", rc.driftBps));
+        newTrades.push(abortedTrade(po.opp, "liquidez o saldo insuficiente al ejecutar", rc.driftBps, now));
       } else {
-        newTrades.push(abortedTrade(po.opp, rc.reason ?? "condiciones cambiaron", rc.driftBps));
+        newTrades.push(abortedTrade(po.opp, rc.reason ?? "condiciones cambiaron", rc.driftBps, now));
       }
       // Cuenta por ORDEN abortada (un tick adverso con varias pendientes
       // puede disparar el breaker de golpe — comportamiento deseado).

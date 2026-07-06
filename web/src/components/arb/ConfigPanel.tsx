@@ -232,7 +232,7 @@ export function ConfigPanel({ params, patchParams, applyPreset, resetParams }: P
               step={5}
               min={0}
               onChange={(v) => patchParams({ risk: { ...params.risk, cooldownSec: Math.round(v) } })}
-              tip="Tras un halt, el bot se re-arma solo pasado este tiempo (racha a cero, pico = P&L actual). 0 = solo re-armado manual."
+              tip="Tras un halt OPERATIVO (datos stale, abortos, spread anómalo) el bot se re-arma solo pasado este tiempo. El trip por drawdown es DURO: siempre exige re-armado manual. 0 = todo manual."
             />
           </Group>
 

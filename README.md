@@ -25,7 +25,7 @@ en bruto puede ser negativa tras **fees, slippage y liquidez** — y ahí está 
 | Motor cuant | **TypeScript puro** (funciones puras y testeables en `lib/arb/`) |
 | Tiempo real | **WebSocket** (order book L2 + top-of-book) + **REST** (fallback) |
 | Datos de mercado | APIs públicas de **Coinbase, Kraken, Bitstamp, Gemini, Bitfinex** (sin API keys) |
-| Testing | **tsx** + runner propio (`pnpm test`, 65 aserciones deterministas) |
+| Testing | **tsx** + runner propio (`pnpm test`, 87 aserciones deterministas) |
 | Tooling | **pnpm**, **ESLint**, **MathJax** (render de fórmulas) |
 | Deploy | **Vercel** (producción) · **GitHub** (repo) |
 
@@ -79,9 +79,11 @@ Cliente (React, ~1.2s + push WS) — todo recibe EngineParams (44 tunables runti
   en retail) con haircut por probabilidad de fill configurable (riesgo de ejecución).
 - **Cálculo neto completo**: fees por exchange + slippage (order book real) + **adverse selection
   por latencia de red** + **withdrawal fee amortizado** (rebalanceo).
-- **Circuit breaker**: detiene la ejecución ante datos stale, spread anómalo (dato corrupto), drawdown
-  o **N ejecuciones abortadas seguidas** (mercado más rápido que la ejecución). Se **re-arma solo**
-  tras un cooldown configurable (racha a cero, pico = P&L actual) o manualmente con un clic.
+- **Circuit breaker con semántica de mesa real**: detiene la ejecución ante datos stale, spread
+  anómalo (dato corrupto), drawdown o **N ejecuciones abortadas seguidas**. Los trips *operativos*
+  (stale/anómalo/abortos) se **re-arman solos** tras un cooldown configurable; el trip por
+  **drawdown es duro** — un límite de pérdida exige re-armado manual, no se renueva solo. Los
+  auto-rearms quedan contados en la analítica (transparencia).
 - **Laboratorio de experimentos**: hasta 4 configuraciones (presets + la tuya) corren **en paralelo
   sobre el mismo mercado en vivo**, cada una con wallets, breaker y rebalanceos independientes —
   tabla comparativa y P&L superpuesto para ver los trade-offs con evidencia, no con opiniones.
@@ -98,7 +100,7 @@ Cliente (React, ~1.2s + push WS) — todo recibe EngineParams (44 tunables runti
 - **Panel de métricas**: latencia de detección p50/p99, throughput WS (msgs/seg), frescura de datos.
 - **Sesión persistente**: P&L, ledger, wallets y transferencias sobreviven recargas (localStorage);
   el ledger se exporta a **CSV**.
-- **Tests**: `pnpm test` (81 aserciones del motor y el simulador, deterministas).
+- **Tests**: `pnpm test` (87 aserciones del motor y el simulador, deterministas).
 
 ### Decisiones técnicas clave
 
@@ -164,7 +166,7 @@ web/src/
     stats.ts       # z-score (arbitraje estadístico)
     config.ts      # defaults: exchanges, fees, withdrawal, latencia, riesgo
     types.ts
-scripts/test-engine.ts          # tests unitarios (pnpm test, 81 aserciones)
+scripts/test-engine.ts          # tests unitarios (pnpm test, 87 aserciones)
 scripts/test-arb.ts             # test de humo con order books reales
 scripts/record-tape.ts          # graba una cinta del mercado real (pnpm tape)
 scripts/experiment.ts           # sweep de configs sobre la cinta (pnpm experiment)
@@ -183,7 +185,7 @@ cd atalaya-arb/web
 pnpm install        # instala dependencias
 
 pnpm dev            # desarrollo → http://localhost:3000
-pnpm test           # tests unitarios del motor (81 aserciones)
+pnpm test           # tests unitarios del motor (87 aserciones)
 pnpm build          # build de producción
 pnpm start          # sirve el build de producción
 
@@ -211,7 +213,7 @@ No requiere variables de entorno ni API keys: todos los datos son de endpoints p
   real; sesión persistente y export CSV.
 - **Documentación y claridad:** este README, [DEMO.md](DEMO.md), la página
   [Cómo funciona](https://atalaya-arb.vercel.app/como-funciona.html) con la matemática completa, y un
-  motor de funciones puras con 81 aserciones de test.
+  motor de funciones puras con 87 aserciones de test.
 
 ## Limitaciones honestas
 

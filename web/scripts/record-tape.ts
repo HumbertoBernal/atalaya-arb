@@ -27,6 +27,16 @@ async function main() {
 
   let written = 0;
   let failures = 0;
+
+  // Ctrl-C: cerrar el stream limpiamente — lo grabado hasta aquí sigue siendo
+  // una cinta válida (interrumpir una grabación larga es el caso común).
+  process.on("SIGINT", () => {
+    stream.end();
+    console.log(`\nInterrumpido: ${written} ticks grabados (${failures} fallidos) en ${outPath}`);
+    console.log(`La cinta parcial es usable: pnpm experiment ${outPath}`);
+    process.exit(0);
+  });
+
   for (let i = 0; i < totalTicks; i++) {
     const t0 = Date.now();
     try {
@@ -54,4 +64,7 @@ async function main() {
   console.log(`Siguiente paso: pnpm experiment ${outPath}`);
 }
 
-main();
+main().catch((e) => {
+  console.error(`Error: ${e instanceof Error ? e.message : e}`);
+  process.exit(1);
+});

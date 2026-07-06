@@ -170,6 +170,7 @@ export function simulateExecution(
   books: OrderBooks,
   wallets: Record<string, Wallet>,
   p: EngineParams = DEFAULT_PARAMS,
+  now: number = Date.now(), // inyectable → replay de cintas 100% determinista
 ): { trade: Trade | null; wallets: Record<string, Wallet> } {
   const buyW = wallets[opp.buyEx];
   const sellW = wallets[opp.sellEx];
@@ -223,7 +224,7 @@ export function simulateExecution(
 
   const trade: Trade = {
     id: `${opp.buyEx}-${opp.sellEx}-${books[opp.buyEx].ts}`,
-    ts: Date.now(),
+    ts: now,
     buyEx: opp.buyEx,
     sellEx: opp.sellEx,
     qty: exec.qty,
@@ -269,10 +270,10 @@ export function recheckOpportunity(
 }
 
 /** Entrada de ledger para una orden abortada por la re-verificación. */
-export function abortedTrade(opp: Opportunity, reason: string, driftBps: number): Trade {
+export function abortedTrade(opp: Opportunity, reason: string, driftBps: number, now: number = Date.now()): Trade {
   return {
-    id: `abort-${opp.buyEx}-${opp.sellEx}-${Date.now()}`,
-    ts: Date.now(),
+    id: `abort-${opp.buyEx}-${opp.sellEx}-${now}`,
+    ts: now,
     buyEx: opp.buyEx,
     sellEx: opp.sellEx,
     qty: 0,

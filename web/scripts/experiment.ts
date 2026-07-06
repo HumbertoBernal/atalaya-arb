@@ -65,11 +65,18 @@ function replay(label: string, params: EngineParams, ticks: Tick[]): RunResult {
 function main() {
   const tapePath = process.argv[2];
   const grid = process.argv.includes("--grid");
-  if (!tapePath) {
-    console.error("Uso: pnpm experiment <cinta.jsonl> [--grid]");
+  if (!tapePath || tapePath.startsWith("--")) {
+    console.error("Uso: pnpm experiment <cinta.jsonl> [--grid]\nGraba una cinta primero: pnpm tape 15");
     process.exit(1);
   }
-  const ticks = loadTape(tapePath);
+  let ticks: Tick[];
+  try {
+    ticks = loadTape(tapePath);
+  } catch (e) {
+    console.error(`No se pudo leer la cinta "${tapePath}": ${e instanceof Error ? e.message : e}`);
+    console.error("¿Grabaste una? → pnpm tape 15");
+    process.exit(1);
+  }
   if (ticks.length < 10) {
     console.error(`Cinta demasiado corta (${ticks.length} ticks). Graba más con: pnpm tape 15`);
     process.exit(1);
