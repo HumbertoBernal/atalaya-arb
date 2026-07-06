@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Atalaya: torre de vigía estilizada sobre fondo oscuro, acento cyan de marca -->
+  <rect width="64" height="64" rx="14" fill="#0a0a0b"/>
+  <g stroke="#22d3ee" stroke-width="4" stroke-linecap="round" fill="none">
+    <path d="M32 50 L32 26"/>
+    <path d="M20 26 L44 26"/>
+    <path d="M22 26 L22 18 M32 26 L32 16 M42 26 L42 18"/>
+  </g>
+  <circle cx="32" cy="10" r="3.5" fill="#34d399"/>
+  <path d="M22 54 L42 54" stroke="#3f3f46" stroke-width="4" stroke-linecap="round"/>
+</svg>

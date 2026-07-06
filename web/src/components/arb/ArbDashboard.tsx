@@ -238,7 +238,38 @@ export function ArbDashboard() {
 
         {/* Oportunidades */}
         <Panel className="mt-6" title="Oportunidades cross-exchange" right={e.pendingPairs.length ? `${e.pendingPairs.length} en ejecución` : undefined}>
-          <div className="overflow-x-auto">
+          {/* Móvil: cards apiladas (la tabla no cabe) */}
+          <div className="md:hidden space-y-2">
+            {loading && Array.from({ length: 3 }).map((_, i) => <div key={i} className="h-16 rounded-lg bg-neutral-800 animate-pulse" />)}
+            {!loading && e.opps.slice(0, 6).map((o) => {
+              const pending = e.pendingPairs.includes(`${o.buyEx}>${o.sellEx}`);
+              return (
+                <div key={`${o.buyEx}-${o.sellEx}`} className="rounded-lg border border-neutral-800 bg-neutral-950/50 p-3">
+                  <div className="flex items-center justify-between text-sm">
+                    <span>{EXCHANGE_LABEL[o.buyEx]} → {EXCHANGE_LABEL[o.sellEx]}</span>
+                    {o.viable ? (
+                      pending ? <span className="text-cyan-300 text-xs">⏳ ejecutando</span> : <span className="text-emerald-400 text-xs">✓ viable</span>
+                    ) : o.netProfit > 0 ? (
+                      <span className="text-amber-500/80 text-xs">bajo umbral</span>
+                    ) : (
+                      <span className="text-neutral-500 text-xs">no neto</span>
+                    )}
+                  </div>
+                  <div className="mt-1.5 flex items-center justify-between font-mono text-xs text-neutral-400">
+                    <span>{o.grossBps.toFixed(1)} bps bruto</span>
+                    <span>{o.maxQty > 0 ? `${fmtNum(o.maxQty, 3)} BTC` : "—"}</span>
+                    <span className={o.netProfit > 0 ? "text-emerald-400" : "text-neutral-500"}>{fmtUsd(o.netProfit)} neto</span>
+                  </div>
+                </div>
+              );
+            })}
+            {!loading && e.opps.length === 0 && (
+              <p className="text-center text-neutral-500 text-sm py-4">Mercado eficiente ahora mismo — sin divergencias netas.</p>
+            )}
+          </div>
+
+          {/* Desktop: tabla completa con desglose de costos */}
+          <div className="hidden md:block overflow-x-auto">
             <table className="w-full text-sm">
               <thead className="text-neutral-400 border-b border-neutral-800">
                 <tr>

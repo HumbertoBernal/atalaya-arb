@@ -13,9 +13,20 @@ const jetBrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
+  metadataBase: new URL("https://atalaya-arb.vercel.app"),
   title: "Atalaya · Arbitraje BTC en tiempo real",
   description:
-    "Bot de arbitraje de Bitcoin: detección en tiempo real de divergencias entre exchanges, ejecución simulada neta de fees, slippage y latencia.",
+    "Bot de arbitraje de Bitcoin: detección en tiempo real entre 5 exchanges, ejecución simulada en dos fases neta de fees, slippage y latencia. 44 parámetros en runtime, modo caos y laboratorio de estrategias en paralelo.",
+  icons: { icon: "/icon.svg" },
+  openGraph: {
+    title: "Atalaya · Arbitraje BTC en tiempo real",
+    description:
+      "Detección en vivo entre 5 exchanges · ejecución en dos fases · 44 parámetros en runtime · modo caos · laboratorio de estrategias en paralelo.",
+    url: "https://atalaya-arb.vercel.app",
+    siteName: "Atalaya",
+    locale: "es_MX",
+    type: "website",
+  },
 };
 
 export default function RootLayout({
