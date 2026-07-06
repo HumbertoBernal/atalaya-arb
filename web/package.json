@@ -7,7 +7,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "tsx scripts/test-engine.ts"
+    "test": "tsx scripts/test-engine.ts",
+    "tape": "tsx scripts/record-tape.ts",
+    "experiment": "tsx scripts/experiment.ts"
   },
   "dependencies": {
     "next": "16.2.6",

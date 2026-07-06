@@ -64,7 +64,7 @@
    ▼                                            ▼
 LiveFeed + L2Feed (cliente) ──► merge (L2 depth / REST) ──► applyChaos() ──► motor
                                                             (escenarios adversos, demo)
-Todo el motor recibe EngineParams — 43 parámetros ajustables en runtime
+Todo el motor recibe EngineParams — 44 parámetros ajustables en runtime
    ├─ detectOpportunities()   cross-exchange, umbral en bps, ranking por neto
    ├─ optimalArb()            tamaño óptimo por profitabilidad marginal
    ├─ frictionCosts()         latencia (adverse selection) + retiro amortizado
@@ -139,15 +139,22 @@ Todo el motor recibe EngineParams — 43 parámetros ajustables en runtime
   <h2>5 · Parametrización: el motor como función de sus supuestos</h2>
   <div class="panel">
     <p style="margin-top:0">El motor son funciones puras que reciben <code>EngineParams</code> —
-      <strong>43 parámetros ajustables en runtime</strong> desde el panel de la UI, sin recargar:
+      <strong>44 parámetros ajustables en runtime</strong> desde el panel de la UI, sin recargar:
       umbral mínimo en bps, tamaño máximo por orden, exchanges activos, fees taker/maker por venue,
       latencia y withdrawal por venue, tolerancia de deriva, límites del circuit breaker, política de
       rebalanceo (mínimos, fee de red, delay de confirmación) y capital inicial.</p>
-    <p style="margin-bottom:0">Esto convierte cada supuesto del modelo en una <strong>hipótesis
+    <p>Esto convierte cada supuesto del modelo en una <strong>hipótesis
       explorable</strong>: ¿a qué fee muere el arbitraje? ¿cuánta tolerancia de deriva aguanta la
       estrategia? ¿qué pasa con 2 venues en vez de 5? El jurado puede responderlas en vivo.
       Además hay un <strong>modo caos</strong> que inyecta escenarios adversos (venue caído, shock de
       precio, sequía de liquidez, feeds congelados) para ver reaccionar las defensas.</p>
+    <p style="margin-bottom:0">Y dos formas de <strong>responder con evidencia</strong> qué configuración
+      funciona: el <strong>Laboratorio</strong> del dashboard corre hasta 4 configs en paralelo sobre el
+      mismo mercado en vivo (cada una con wallets, breaker y rebalanceos propios), y por CLI
+      <code>pnpm tape</code> graba una cinta del mercado real que <code>pnpm experiment</code> replaya
+      con una grilla de configuraciones — determinista y reproducible. La misma lógica en los tres
+      casos: el simulador puro <code>stepSession()</code>. Advertencia honesta: una corrida corta es un
+      solo régimen de mercado; lo que se aprende son <em>trade-offs</em>, no una config mágica.</p>
   </div>
 
   <h2>6 · Honestidad: por qué NO usamos ML</h2>

@@ -3,35 +3,31 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   DET_WINDOW,
-  EQUITY_WINDOW,
   EXCHANGES,
   POLL_MS,
   SPREAD_WINDOW,
-  TRADES_MAX,
   TRIANGULAR_POLL_MS,
 } from "@/lib/arb/config";
-import {
-  abortedTrade,
-  detectOpportunities,
-  recheckOpportunity,
-  simulateExecution,
-} from "@/lib/arb/engine";
-import { mergeBooks, percentile, referencePrice } from "@/lib/arb/mergeBooks";
+import { mergeBooks, percentile } from "@/lib/arb/mergeBooks";
 import { LiveFeed, type FeedStatus } from "@/lib/arb/livefeed";
 import { L2Feed } from "@/lib/arb/l2book";
 import { applyChaos, chaosActive, NO_CHAOS, type ChaosState } from "@/lib/arb/chaos";
+import { freshDefaults, mergeParams, PRESETS, type EngineParams, type PresetId } from "@/lib/arb/params";
+import type { RiskState } from "@/lib/arb/risk";
 import {
-  creditTransfer,
-  debitTransfers,
-  needsRebalance,
-  planRebalance,
-  projectWallets,
-} from "@/lib/arb/rebalance";
-import { freshDefaults, isActive, mergeParams, PRESETS, type EngineParams, type PresetId } from "@/lib/arb/params";
-import { evaluateRisk, sanitizeOpportunities, type RiskState } from "@/lib/arb/risk";
+  initSimState,
+  initWallets,
+  rearm,
+  stepSession,
+  emptyStats,
+  type SessionStats,
+  type SimState,
+} from "@/lib/arb/simulator";
 import { pushCapped, zScore, type ZScore } from "@/lib/arb/stats";
 import { detectTriangular, type TriBooks, type TriResult } from "@/lib/arb/triangular";
 import type { OrderBook, Opportunity, Trade, Transfer, Wallet } from "@/lib/arb/types";
+
+export type { SessionStats } from "@/lib/arb/simulator";
 
 export const FEE_TIERS = [
   { id: "retail", label: "Retail", mult: 1 },
@@ -42,35 +38,52 @@ export const FEE_TIERS = [
 export type FeeTierId = (typeof FEE_TIERS)[number]["id"];
 
 export type Metrics = { detP50: number; detP99: number; wsRate: number; freshnessMs: number };
-export type SessionStats = {
-  oppsSeen: number;
-  viableSeen: number;
-  filledCount: number; // fills acumulados de la sesión (el ledger se capa a TRADES_MAX)
-  partialCount: number;
-  volumeBtc: number;
-  bestTrade: number;
-  rebalances: number;
-  aborted: number;
-  startTs: number;
-};
-const emptySession = (): SessionStats => ({
-  oppsSeen: 0,
-  viableSeen: 0,
-  filledCount: 0,
-  partialCount: 0,
-  volumeBtc: 0,
-  bestTrade: 0,
-  rebalances: 0,
-  aborted: 0,
-  startTs: 0,
-});
 
-// Orden en dos fases: detectada en el tick N, re-verificada y ejecutada (o
-// abortada) contra el libro fresco del tick N+1 — la ventana de ejecución real.
-type PendingOrder = { opp: Opportunity; createdTs: number };
+// --- Laboratorio: configs corriendo en paralelo sobre el mismo mercado ---
+export type LabConfigId = PresetId | "actual";
+
+export type LabRunSummary = {
+  id: LabConfigId;
+  label: string;
+  color: string;
+  pnl: number;
+  filled: number;
+  aborted: number;
+  viableSeen: number;
+  volumeBtc: number;
+  rebalances: number;
+  breaker: "ok" | "cooldown" | "halt";
+};
+
+export type LabView = {
+  active: boolean; // sigue avanzando con cada tick
+  startTs: number;
+  ticks: number;
+  runs: LabRunSummary[];
+  series: Array<Record<string, number>>; // { t, [configId]: pnl }
+};
+
+const LAB_COLORS: Record<LabConfigId, string> = {
+  conservador: "#34d399",
+  balanceado: "#22d3ee",
+  agresivo: "#fbbf24",
+  actual: "#a78bfa",
+};
+const LAB_SERIES_MAX = 240;
+
+type LabRun = {
+  id: LabConfigId;
+  label: string;
+  color: string;
+  params: EngineParams;
+  state: SimState;
+  risk: RiskState | null;
+};
+type LabInternal = { active: boolean; startTs: number; ticks: number; series: Array<Record<string, number>>; runs: LabRun[] };
+const emptyLab = (): LabInternal => ({ active: false, startTs: 0, ticks: 0, series: [], runs: [] });
 
 const PARAMS_KEY = "atalaya.params.v1";
-const SESSION_KEY = "atalaya.session.v2"; // v2: SessionStats con filledCount/partialCount
+const SESSION_KEY = "atalaya.session.v3"; // v3: snapshot del SimState del simulador
 const SESSION_MAX_AGE_MS = 24 * 3600_000;
 
 type SavedSession = {
@@ -79,7 +92,7 @@ type SavedSession = {
   peakPnl: number;
   trades: Trade[];
   equity: { t: number; pnl: number }[];
-  session: SessionStats;
+  stats: SessionStats;
   transfers: Transfer[];
   savedAt: number;
 };
@@ -102,13 +115,26 @@ function persistParams(p: EngineParams) {
   }
 }
 
-function initWallets(p: EngineParams): Record<string, Wallet> {
-  const w: Record<string, Wallet> = {};
-  for (const ex of EXCHANGES) w[ex] = { exchange: ex, usd: p.initialUsd, btc: p.initialBtc };
-  return w;
+/** Reconstruye el estado del simulador desde un snapshot persistido.
+ *  Lo transitorio (órdenes pendientes, racha de abortos, cooldown) arranca
+ *  limpio: no tiene sentido re-verificar oportunidades de hace horas. */
+function restoreSimState(saved: SavedSession, p: EngineParams): SimState {
+  const state = initSimState(p);
+  const wallets = initWallets(p);
+  for (const ex of EXCHANGES) {
+    if (saved.wallets?.[ex]) wallets[ex] = saved.wallets[ex];
+  }
+  state.wallets = wallets;
+  state.pnl = saved.pnl ?? 0;
+  state.peakPnl = saved.peakPnl ?? Math.max(0, state.pnl);
+  state.trades = saved.trades ?? [];
+  state.equity = saved.equity ?? [];
+  state.stats = { ...emptyStats(), ...saved.stats };
+  state.transfers = (saved.transfers ?? []).filter((t) => wallets[t.to] && wallets[t.from]);
+  return state;
 }
 
-/** Toda la lógica del motor de arbitraje: feeds, tick, ejecución, métricas. */
+/** Feeds, tick del motor primario, laboratorio, métricas y persistencia. */
 export function useArbEngine() {
   const [params, setParamsState] = useState<EngineParams>(freshDefaults);
   const [books, setBooks] = useState<OrderBook[]>([]);
@@ -122,28 +148,23 @@ export function useArbEngine() {
   const [serverLatency, setServerLatency] = useState(0);
   const [tickCount, setTickCount] = useState(0);
   const [feedStatus, setFeedStatus] = useState<Record<string, FeedStatus>>({});
-  const [risk, setRisk] = useState<RiskState>({ tripped: false, reasons: [], maxBookAgeMs: 0 });
+  const [risk, setRisk] = useState<RiskState>({ tripped: false, hard: false, reasons: [], maxBookAgeMs: 0 });
+  const [breakerUntil, setBreakerUntil] = useState(0);
   const [tri, setTri] = useState<{ results: TriResult[]; ts: number } | null>(null);
   const [metrics, setMetrics] = useState<Metrics>({ detP50: 0, detP99: 0, wsRate: 0, freshnessMs: 0 });
   const [stat, setStat] = useState<ZScore & { current: number }>({ mean: 0, std: 0, z: 0, n: 0, current: 0 });
-  const [session, setSession] = useState<SessionStats>(emptySession);
+  const [session, setSession] = useState<SessionStats>(emptyStats);
   const [chaos, setChaosState] = useState<ChaosState>(NO_CHAOS);
   const [pendingPairs, setPendingPairs] = useState<string[]>([]);
   const [restored, setRestored] = useState(false);
   const [nowTs, setNowTs] = useState(0); // reloj del último tick (evita Date.now() en render)
+  const [lab, setLab] = useState<LabView>({ active: false, startTs: 0, ticks: 0, runs: [], series: [] });
 
-  // Refs que el intervalo necesita leer "frescos" (evitan stale closures).
+  // Estado del simulador primario + refs que el intervalo lee "frescos".
+  const simRef = useRef<SimState>(initSimState(freshDefaults()));
+  const labRef = useRef<LabInternal>(emptyLab());
   const detTimesRef = useRef<number[]>([]);
   const spreadHistRef = useRef<number[]>([]);
-  const sessionRef = useRef<SessionStats>(emptySession());
-  const walletsRef = useRef(wallets);
-  const tradesRef = useRef<Trade[]>([]);
-  const equityRef = useRef<{ t: number; pnl: number }[]>([]);
-  const transfersRef = useRef<Transfer[]>([]);
-  const pendingRef = useRef<PendingOrder[]>([]);
-  const abortsRef = useRef(0); // abortos consecutivos → circuit breaker
-  const pnlRef = useRef(pnl);
-  const peakPnlRef = useRef(0);
   const runningRef = useRef(running);
   const paramsRef = useRef(params);
   const chaosRef = useRef(chaos);
@@ -153,12 +174,10 @@ export function useArbEngine() {
 
   // Sincronizar refs tras cada commit (los closures del intervalo los leen frescos).
   useEffect(() => {
-    walletsRef.current = wallets;
-    pnlRef.current = pnl;
     runningRef.current = running;
     paramsRef.current = params;
     chaosRef.current = chaos;
-  }, [wallets, pnl, running, params, chaos]);
+  }, [running, params, chaos]);
 
   // Arranque (solo cliente): restaurar params + sesión persistida y abrir feeds.
   useEffect(() => {
@@ -171,28 +190,14 @@ export function useArbEngine() {
 
       let sessionRestored = false;
       try {
+        // Migración: snapshots de esquemas previos quedarían huérfanos para siempre.
+        window.localStorage.removeItem("atalaya.session.v1");
+        window.localStorage.removeItem("atalaya.session.v2");
         const raw = window.localStorage.getItem(SESSION_KEY);
         if (raw) {
           const saved = JSON.parse(raw) as SavedSession;
           if (saved.savedAt && Date.now() - saved.savedAt < SESSION_MAX_AGE_MS) {
-            // Merge sobre initWallets: si el snapshot viene de un esquema con
-            // otros venues, los faltantes arrancan con capital y los extra se caen.
-            const restoredW = initWallets(p);
-            for (const ex of EXCHANGES) {
-              if (saved.wallets?.[ex]) restoredW[ex] = saved.wallets[ex];
-            }
-            setWallets(restoredW);
-            walletsRef.current = restoredW;
-            setPnl(saved.pnl);
-            pnlRef.current = saved.pnl;
-            peakPnlRef.current = saved.peakPnl ?? Math.max(0, saved.pnl);
-            setTrades(saved.trades ?? []);
-            tradesRef.current = saved.trades ?? [];
-            setEquity(saved.equity ?? []);
-            equityRef.current = saved.equity ?? [];
-            sessionRef.current = { ...emptySession(), ...saved.session };
-            transfersRef.current = saved.transfers ?? [];
-            setTransfers(transfersRef.current);
+            simRef.current = restoreSimState(saved, p);
             sessionRestored = true;
           }
         }
@@ -200,12 +205,15 @@ export function useArbEngine() {
         /* snapshot corrupto → sesión limpia */
       }
       if (!sessionRestored) {
-        const w = initWallets(p);
-        setWallets(w);
-        walletsRef.current = w;
-        sessionRef.current.startTs = Date.now();
+        simRef.current = initSimState(p, Date.now());
       }
-      setSession({ ...sessionRef.current });
+      const s = simRef.current;
+      setWallets(s.wallets);
+      setPnl(s.pnl);
+      setTrades(s.trades);
+      setEquity(s.equity);
+      setTransfers(s.transfers);
+      setSession({ ...s.stats });
       setRestored(sessionRestored);
     });
 
@@ -219,14 +227,15 @@ export function useArbEngine() {
     // Autosave del snapshot de sesión (para sobrevivir recargas).
     const saveId = setInterval(() => {
       try {
+        const s = simRef.current;
         const snap: SavedSession = {
-          wallets: walletsRef.current,
-          pnl: pnlRef.current,
-          peakPnl: peakPnlRef.current,
-          trades: tradesRef.current,
-          equity: equityRef.current,
-          session: sessionRef.current,
-          transfers: transfersRef.current,
+          wallets: s.wallets,
+          pnl: s.pnl,
+          peakPnl: s.peakPnl,
+          trades: s.trades,
+          equity: s.equity,
+          stats: s.stats,
+          transfers: s.transfers,
           savedAt: Date.now(),
         };
         window.localStorage.setItem(SESSION_KEY, JSON.stringify(snap));
@@ -243,7 +252,7 @@ export function useArbEngine() {
   }, []);
 
   const busyRef = useRef(false); // guard de re-entrada: un fetch lento (>POLL_MS)
-  // solaparía ticks y sus setWallets se pisarían entre sí (P&L ≠ wallets).
+  // solaparía ticks y sus actualizaciones de estado se pisarían entre sí.
 
   const tickBody = useCallback(async () => {
     let payload: { books: OrderBook[]; serverLatencyMs: number };
@@ -284,12 +293,27 @@ export function useArbEngine() {
     setFeedStatus({ ...(feedRef.current?.getStatus() ?? {}), ...(l2Ref.current?.getStatus() ?? {}) });
     setTickCount((cnt) => cnt + 1);
 
-    // Detección (medimos su latencia de cómputo).
+    // Motor primario: un paso del simulador (medimos su latencia de cómputo).
     const t0 = performance.now();
-    const detectedRaw = detectOpportunities(map, p);
+    const out = stepSession(simRef.current, map, merged, p, now, runningRef.current);
     detTimesRef.current = pushCapped(detTimesRef.current, performance.now() - t0, DET_WINDOW);
-    const detected = sanitizeOpportunities(detectedRaw, p.risk.maxGrossBps);
-    setOpps(detected);
+    simRef.current = out.state;
+
+    // Laboratorio: cada config sombra avanza sobre LOS MISMOS libros (incluido
+    // el caos inyectado) con su propia economía independiente.
+    const labI = labRef.current;
+    if (labI.active && labI.runs.length) {
+      for (const run of labI.runs) {
+        const r = stepSession(run.state, map, merged, run.params, now, true);
+        run.state = r.state;
+        run.risk = r.risk;
+      }
+      labI.ticks += 1;
+      const point: Record<string, number> = { t: now };
+      for (const run of labI.runs) point[run.id] = +run.state.pnl.toFixed(2);
+      labI.series = [...labI.series, point].slice(-LAB_SERIES_MAX);
+      setLab(labViewOf(labI, now));
+    }
 
     // Métricas de latencia/throughput.
     const wsRate =
@@ -304,129 +328,23 @@ export function useArbEngine() {
     });
 
     // Arbitraje estadístico (z-score del mayor spread).
-    const maxGross = detectedRaw.length ? Math.max(...detectedRaw.map((o) => o.grossBps)) : 0;
+    const maxGross = out.detectedRaw.length ? Math.max(...out.detectedRaw.map((o) => o.grossBps)) : 0;
     spreadHistRef.current = pushCapped(spreadHistRef.current, maxGross, SPREAD_WINDOW);
     setStat({ ...zScore(spreadHistRef.current), current: maxGross });
 
-    const s = sessionRef.current;
-    s.oppsSeen += detectedRaw.length;
-    s.viableSeen += detected.filter((o) => o.viable).length;
-
-    // Circuit breaker (incluye abortos de ejecución consecutivos).
-    const r = evaluateRisk(merged, detectedRaw, pnlRef.current, peakPnlRef.current, now, p.risk, abortsRef.current);
-    setRisk(r);
-
-    let w = walletsRef.current;
-    let walletsTouched = false;
-    const newTrades: Trade[] = [];
-    let gained = 0;
-
-    // Llegadas de transferencias de rebalanceo (confirmación on-chain simulada).
-    const arrivals = transfersRef.current.filter((t) => now >= t.arriveTs);
-    if (arrivals.length) {
-      for (const t of arrivals) w = creditTransfer(w, t);
-      transfersRef.current = transfersRef.current.filter((t) => now < t.arriveTs);
-      walletsTouched = true;
-    }
-
-    if (runningRef.current && !r.tripped) {
-      // FASE 2: órdenes creadas el tick pasado se re-verifican contra el libro
-      // fresco. Si el neto se derrumbó o el spread se cerró → aborto (visible).
-      const pend = pendingRef.current;
-      pendingRef.current = [];
-      for (const po of pend) {
-        // Venue desactivado con la orden en vuelo → se cancela sin ejecutar.
-        if (!isActive(p, po.opp.buyEx) || !isActive(p, po.opp.sellEx)) continue;
-        const rc = recheckOpportunity(po.opp, map, p);
-        if (rc.ok && rc.fresh) {
-          const { trade, wallets: nextW } = simulateExecution(rc.fresh, map, w, p);
-          if (trade) {
-            trade.driftBps = rc.driftBps;
-            w = nextW;
-            walletsTouched = true;
-            newTrades.push(trade);
-            gained += trade.netProfit;
-            abortsRef.current = 0;
-            continue;
-          }
-          newTrades.push(abortedTrade(po.opp, "liquidez o saldo insuficiente al ejecutar", rc.driftBps));
-        } else {
-          newTrades.push(abortedTrade(po.opp, rc.reason ?? "condiciones cambiaron", rc.driftBps));
-        }
-        // Cuenta por ORDEN abortada (un tick adverso con varias pendientes
-        // puede disparar el breaker de golpe — comportamiento deseado).
-        abortsRef.current += 1;
-        s.aborted += 1;
-      }
-
-      // FASE 1: lo viable detectado ahora entra como orden pendiente y se
-      // ejecutará (o abortará) el próximo tick — la ventana de ejecución.
-      // (detectOpportunities produce cada par a lo sumo una vez.)
-      for (const opp of detected.filter((o) => o.viable)) {
-        pendingRef.current.push({ opp, createdTs: now });
-      }
-
-      // Rebalanceo dirigido si algún venue ACTIVO se agotó y no viene nada en
-      // camino: déficits sobre saldos proyectados (real + en tránsito) para no
-      // duplicar envíos; venues desactivados donan pero no reciben.
-      const projected = projectWallets(w, transfersRef.current);
-      const activeProjected = Object.fromEntries(
-        Object.entries(projected).filter(([ex]) => isActive(p, ex)),
-      );
-      const refP = referencePrice(merged);
-      if (refP && needsRebalance(activeProjected, p.rebalance)) {
-        const plan = planRebalance(w, refP, p.rebalance, now, {
-          projected,
-          canReceive: (ex) => isActive(p, ex),
-        });
-        if (plan.transfers.length) {
-          w = debitTransfers(w, plan.transfers);
-          transfersRef.current = [...transfersRef.current, ...plan.transfers];
-          walletsTouched = true;
-          const newPnl = pnlRef.current - plan.costUsd;
-          setPnl(newPnl);
-          pnlRef.current = newPnl;
-          s.rebalances += 1;
-        }
-      }
-    } else if (pendingRef.current.length) {
-      // Breaker activo o pausa: las órdenes pendientes se cancelan sin ejecutar.
-      pendingRef.current = [];
-    }
-
-    if (newTrades.length) {
-      const newPnl = pnlRef.current + gained;
-      setPnl(newPnl);
-      pnlRef.current = newPnl;
-      peakPnlRef.current = Math.max(peakPnlRef.current, newPnl);
-      const ordered = [...newTrades].reverse(); // fuera del updater (debe ser puro)
-      setTrades((prev) => {
-        const next = [...ordered, ...prev].slice(0, TRADES_MAX);
-        tradesRef.current = next;
-        return next;
-      });
-      for (const tr of newTrades) {
-        if (tr.status !== "filled") continue;
-        s.filledCount += 1;
-        if (tr.partial) s.partialCount += 1;
-        s.volumeBtc += tr.qty;
-        s.bestTrade = Math.max(s.bestTrade, tr.netProfit);
-      }
-    }
-    if (walletsTouched) {
-      setWallets(w);
-      walletsRef.current = w; // sync inmediato: no esperar al effect post-commit
-    }
-
-    setTransfers([...transfersRef.current]);
-    setPendingPairs(pendingRef.current.map((po) => `${po.opp.buyEx}>${po.opp.sellEx}`));
+    // Espejos para render.
+    const s = out.state;
+    setOpps(out.detected);
+    setRisk(out.risk);
+    setBreakerUntil(s.breakerUntil);
+    setWallets(s.wallets);
+    setPnl(s.pnl);
+    setTrades(s.trades);
+    setTransfers(s.transfers);
+    setPendingPairs(s.pending.map((po) => `${po.opp.buyEx}>${po.opp.sellEx}`));
+    setSession({ ...s.stats });
+    setEquity(s.equity);
     setNowTs(now);
-    setSession({ ...s });
-    setEquity((prev) => {
-      const next = [...prev, { t: now, pnl: pnlRef.current }].slice(-EQUITY_WINDOW);
-      equityRef.current = next;
-      return next;
-    });
   }, []);
 
   const tick = useCallback(async () => {
@@ -503,28 +421,59 @@ export function useArbEngine() {
 
   // Re-armar el breaker manualmente (como en una mesa real: intervención humana).
   const rearmBreaker = useCallback(() => {
-    abortsRef.current = 0;
-    peakPnlRef.current = pnlRef.current;
+    simRef.current = rearm(simRef.current);
+    setBreakerUntil(0);
+    setRisk((prev) => ({ ...prev, tripped: false, reasons: [] })); // optimista; el próximo tick re-evalúa
+  }, []);
+
+  // --- Laboratorio de experimentos ---
+  const startLab = useCallback((ids: LabConfigId[]) => {
+    // Defensa en profundidad (la UI ya lo garantiza): sin duplicados, ids
+    // conocidos, y mínimo 2 configs para que comparar tenga sentido.
+    const valid = [...new Set(ids)].filter((id) => id === "actual" || PRESETS.some((x) => x.id === id));
+    if (valid.length < 2) return;
+    const now = Date.now();
+    const current = paramsRef.current;
+    const runs: LabRun[] = valid.map((id) => {
+      const preset = PRESETS.find((x) => x.id === id);
+      // Presets se aplican sobre TU config actual: mismo tier/fees/venues en
+      // todas las corridas — solo difieren los knobs de estrategia (comparación justa).
+      const runParams = preset ? preset.apply(structuredClone(current)) : structuredClone(current);
+      return {
+        id,
+        label: preset?.label ?? "Tu config actual",
+        color: LAB_COLORS[id],
+        params: runParams,
+        state: initSimState(runParams, now),
+        risk: null,
+      };
+    });
+    labRef.current = { active: true, startTs: now, ticks: 0, series: [], runs };
+    setLab(labViewOf(labRef.current, now));
+  }, []);
+
+  const stopLab = useCallback(() => {
+    labRef.current.active = false;
+    setLab(labViewOf(labRef.current, Date.now()));
+  }, []);
+
+  const clearLab = useCallback(() => {
+    labRef.current = emptyLab();
+    setLab({ active: false, startTs: 0, ticks: 0, runs: [], series: [] });
   }, []);
 
   const reset = useCallback(() => {
-    const p = paramsRef.current;
-    setWallets(initWallets(p));
+    simRef.current = initSimState(paramsRef.current, Date.now());
+    const s = simRef.current;
+    setWallets(s.wallets);
     setTrades([]);
-    tradesRef.current = [];
     setPnl(0);
-    pnlRef.current = 0;
-    peakPnlRef.current = 0;
     setEquity([]);
-    equityRef.current = [];
-    setTickCount(0);
-    transfersRef.current = [];
     setTransfers([]);
-    pendingRef.current = [];
     setPendingPairs([]);
-    abortsRef.current = 0;
-    sessionRef.current = { ...emptySession(), startTs: Date.now() };
-    setSession({ ...sessionRef.current });
+    setBreakerUntil(0);
+    setTickCount(0);
+    setSession({ ...s.stats });
     spreadHistRef.current = [];
     setRestored(false);
     try {
@@ -547,6 +496,7 @@ export function useArbEngine() {
     stat,
     session,
     risk,
+    breakerUntil,
     tri,
     feedStatus,
     serverLatency,
@@ -558,6 +508,7 @@ export function useArbEngine() {
     pendingPairs,
     restored,
     nowTs,
+    lab,
     // controles
     patchParams,
     applyPreset,
@@ -565,7 +516,31 @@ export function useArbEngine() {
     setChaos,
     clearChaos,
     rearmBreaker,
+    startLab,
+    stopLab,
+    clearLab,
     toggleRunning: () => setRunning((v) => !v),
     reset,
+  };
+}
+
+function labViewOf(lab: LabInternal, now: number): LabView {
+  return {
+    active: lab.active,
+    startTs: lab.startTs,
+    ticks: lab.ticks,
+    series: lab.series,
+    runs: lab.runs.map((run) => ({
+      id: run.id,
+      label: run.label,
+      color: run.color,
+      pnl: run.state.pnl,
+      filled: run.state.stats.filledCount,
+      aborted: run.state.stats.aborted,
+      viableSeen: run.state.stats.viableSeen,
+      volumeBtc: run.state.stats.volumeBtc,
+      rebalances: run.state.stats.rebalances,
+      breaker: run.risk?.tripped ? (run.state.breakerUntil >= now ? "cooldown" : "halt") : "ok",
+    })),
   };
 }

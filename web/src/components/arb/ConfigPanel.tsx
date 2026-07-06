@@ -225,6 +225,15 @@ export function ConfigPanel({ params, patchParams, applyPreset, resetParams }: P
               onChange={(v) => patchParams({ risk: { ...params.risk, maxConsecutiveLosses: Math.round(v) } })}
               tip="Órdenes abortadas seguidas (mercado más rápido que la ejecución) que disparan el breaker."
             />
+            <Num
+              label="Cooldown del breaker"
+              suffix="s"
+              value={params.risk.cooldownSec}
+              step={5}
+              min={0}
+              onChange={(v) => patchParams({ risk: { ...params.risk, cooldownSec: Math.round(v) } })}
+              tip="Tras un halt OPERATIVO (datos stale, abortos, spread anómalo) el bot se re-arma solo pasado este tiempo. El trip por drawdown es DURO: siempre exige re-armado manual. 0 = todo manual."
+            />
           </Group>
 
           {/* Rebalanceo */}

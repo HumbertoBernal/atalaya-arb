@@ -16,10 +16,10 @@ Demo de ~2 minutos, pensada para un jurado técnico. Cada paso indica **qué dec
 Abre la URL. Señala que ya está corriendo en vivo (no es un video). Si aparece el badge
 "Sesión restaurada", menciónalo: el estado sobrevive recargas.
 
-## 1 · Parametrización — 43 variables en runtime (25s) · *criterio: profundidad y parametrización*
+## 1 · Parametrización — 44 variables en runtime (25s) · *criterio: profundidad y parametrización*
 - Abre el panel **"Parámetros del motor"**. Recorre los grupos: estrategia, exchanges activos,
   fees por venue, riesgo, rebalanceo, capital.
-  > "Todo el motor recibe estos parámetros por inyección — 43 variables ajustables sin recargar."
+  > "Todo el motor recibe estos parámetros por inyección — 44 variables ajustables sin recargar."
 - Sube el **umbral mínimo a 5 bps** → en la tabla de oportunidades aparecen filas "bajo umbral":
   netas positivas que el bot ahora rechaza por política.
 - Apaga un exchange (p. ej. Bitfinex) → desaparece del universo de detección al instante.
@@ -35,30 +35,39 @@ Abre la URL. Señala que ya está corriendo en vivo (no es un video). Si aparece
 - Señala una fila "⏳ ejecutando": **ejecución en dos fases** — la orden se re-verifica contra
   el libro fresco antes de llenarse; si el neto derrapó, se aborta (se ve en el ledger con Δbps).
 
-## 3 · Modo caos — robustez demostrada, no afirmada (30s) · *criterio: robustez*
+## 3 · Modo caos — robustez demostrada, no afirmada (25s) · *criterio: robustez*
 - Abre **"Escenarios adversos"**.
 - **Tira un venue** (p. ej. Kraken) → pasa a offline, el bot sigue operando con el resto.
-- **Congela los feeds** → en ~6s el **circuit breaker** dispara por datos stale y detiene la
-  ejecución. Descongela y **re-arma** el breaker con el botón.
+- **Congela los feeds** → en ~6s el **circuit breaker** dispara por datos stale. Señala el
+  contador de **auto re-arm**: el bot se recupera solo tras el cooldown (o con "Re-armar ya").
 - **Sequía de liquidez** → los fills se vuelven parciales o desaparecen.
-  > "No les cuento que es robusto: se los rompo en vivo y ven cómo reacciona."
+  > "No les cuento que es robusto: se los rompo en vivo y ven cómo reacciona — y cómo se recupera."
 
-## 4 · Wallets y rebalanceo (15s) · *criterio: gestión de wallets*
+## 4 · Laboratorio — ¿qué config funciona? Evidencia, no opinión (20s) · *criterio: parametrización*
+- Abre **"Laboratorio"**, selecciona Conservador + Balanceado + Agresivo y **▶ Iniciar**.
+- A los pocos ticks: tabla comparativa (P&L, fills, abortos, breaker por config) y P&L superpuesto.
+  > "Tres estrategias corriendo en paralelo sobre exactamente el mismo mercado, cada una con su
+  > propia economía. Y para rigor reproducible: `pnpm tape` graba el mercado real y
+  > `pnpm experiment` barre una grilla de configs contra la misma cinta."
+- Si el modo caos sigue activo, mejor aún: se ve qué config sobrevive el estrés.
+
+## 5 · Wallets y rebalanceo (15s) · *criterio: gestión de wallets*
 - **Balances de wallets**: el inventario se mueve con cada trade.
 - Si aparece el recuadro **"En tránsito"**: transferencias dirigidas venue→venue con fee de red
   y confirmación on-chain simulada.
   > "Rebalancear no es gratis ni instantáneo: el BTC en tránsito no está disponible para operar."
 
-## 5 · Estrategia y visualización (15s) · *criterio: UI/visualización*
+## 6 · Estrategia y visualización (15s) · *criterio: UI/visualización*
 - **Profundidad del libro**: la materia prima del slippage, por venue.
 - **Matriz de spreads** (25 combinaciones), **triangular** (USD→BTC→ETH→USD) y **estadístico**
   (z-score / mean-reversion). "Tres estrategias, no una."
 - **Export CSV** del ledger para auditar las operaciones.
 
-## 6 · Cierre — código y honestidad (5s) · *criterio: documentación y claridad*
-> "Todo es TypeScript tipado, con el motor en funciones puras — `pnpm test`, 65 aserciones.
-> Y lo más importante: es **honesto**. No promete alpha que no existe; demuestra exactamente
-> dónde y por qué el arbitraje funciona, y qué lo mata."
+## 7 · Cierre — código y honestidad (5s) · *criterio: documentación y claridad*
+> "Todo es TypeScript tipado, con un solo simulador puro que comparten el dashboard, el laboratorio
+> y los experimentos por CLI — `pnpm test`, 87 aserciones. Y lo más importante: es **honesto**.
+> No promete alpha que no existe; demuestra exactamente dónde y por qué el arbitraje funciona,
+> y qué lo mata."
 
 ---
 

@@ -16,6 +16,7 @@ import type { OrderBook, Trade, Transfer, Wallet } from "@/lib/arb/types";
 import { ChaosPanel } from "./ChaosPanel";
 import { ConfigPanel } from "./ConfigPanel";
 import { DepthChart } from "./DepthChart";
+import { LabPanel } from "./LabPanel";
 import { SpreadMatrix } from "./SpreadMatrix";
 import { FEE_TIERS, useArbEngine } from "./useArbEngine";
 
@@ -121,13 +122,22 @@ export function ArbDashboard() {
           <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-rose-700 bg-rose-950/40 p-3 text-sm text-rose-200">
             <span>
               <strong>🛑 Circuit breaker activo</strong> — ejecución detenida: {e.risk.reasons.join(" · ")}
+              {e.breakerUntil > e.nowTs ? (
+                <span className="ml-2 text-rose-300/80">
+                  · auto re-arm en ~{Math.max(1, Math.ceil((e.breakerUntil - e.nowTs) / 1000))}s
+                </span>
+              ) : (
+                <span className="ml-2 text-rose-300/80">
+                  · requiere re-armado manual{e.risk.hard ? " (límite de pérdida)" : ""}
+                </span>
+              )}
             </span>
             <button
               onClick={e.rearmBreaker}
               className="rounded-lg border border-rose-600 px-2.5 py-1 text-xs text-rose-200 hover:bg-rose-900/50 transition-colors"
               title="Intervención manual: reinicia el contador de abortos y toma el P&L actual como nuevo pico (como re-armar el kill-switch en una mesa real)."
             >
-              ⟳ Re-armar
+              ⟳ Re-armar ya
             </button>
           </div>
         )}
@@ -176,14 +186,15 @@ export function ArbDashboard() {
           <Toggle active={e.params.maker} onClick={() => e.patchParams({ maker: true })}>Maker (límite)</Toggle>
         </section>
 
-        {/* Parametrización profunda + escenarios adversos */}
+        {/* Parametrización profunda + escenarios adversos + laboratorio */}
         <ConfigPanel params={e.params} patchParams={e.patchParams} applyPreset={e.applyPreset} resetParams={e.resetParams} />
         <ChaosPanel chaos={e.chaos} chaosOn={e.chaosOn} now={e.nowTs} setChaos={e.setChaos} clearChaos={e.clearChaos} />
+        <LabPanel lab={e.lab} nowTs={e.nowTs} startLab={e.startLab} stopLab={e.stopLab} clearLab={e.clearLab} />
 
         {/* Métricas (status strip secundario) */}
         <section className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
-          <Metric label="Detección p50" tip="Tiempo de cómputo del motor por tick (mediana)." value={`${e.metrics.detP50.toFixed(2)} ms`} good={e.metrics.detP50 < 1} />
-          <Metric label="Detección p99" value={`${e.metrics.detP99.toFixed(2)} ms`} good={e.metrics.detP99 < 3} />
+          <Metric label="Motor p50" tip="Tiempo de cómputo del tick completo del simulador (detección + ejecución + rebalanceo), mediana." value={`${e.metrics.detP50.toFixed(2)} ms`} good={e.metrics.detP50 < 1} />
+          <Metric label="Motor p99" value={`${e.metrics.detP99.toFixed(2)} ms`} good={e.metrics.detP99 < 3} />
           <Metric label="WS msgs/seg" tip="Mensajes WebSocket procesados por segundo (throughput)." value={`${e.metrics.wsRate}`} good={e.metrics.wsRate > 0} />
           <Metric label="Frescura datos" value={`${e.metrics.freshnessMs} ms`} good={e.metrics.freshnessMs < 1500} />
         </section>
@@ -312,6 +323,7 @@ export function ArbDashboard() {
               <Stat label="Mejor operación" value={fmtUsd(e.session.bestTrade)} />
               <Stat label="Abortadas (re-check)" value={`${e.session.aborted}`} />
               <Stat label="Rebalanceos" value={`${e.session.rebalances}`} />
+              <Stat label="Auto re-arms del breaker" value={`${e.session.autoRearms}`} />
             </div>
           </Panel>
 

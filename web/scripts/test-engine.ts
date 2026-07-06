@@ -22,6 +22,7 @@ import {
 import { applyChaos, chaosActive, NO_CHAOS } from "../src/lib/arb/chaos";
 import { evaluateRisk } from "../src/lib/arb/risk";
 import { freshDefaults, type EngineParams } from "../src/lib/arb/params";
+import { initSimState, rearm, stepSession, type SimState } from "../src/lib/arb/simulator";
 import type { OrderBook, OrderBooks, Wallet } from "../src/lib/arb/types";
 
 let pass = 0;
@@ -287,7 +288,7 @@ console.log("modo caos:");
 console.log("circuit breaker:");
 {
   const fresh = [book("a", 99, 100)];
-  const cfg = { maxBookAgeMs: 6000, maxGrossBps: 150, maxConsecutiveLosses: 3, maxDrawdownUsd: 5000 };
+  const cfg = { maxBookAgeMs: 6000, maxGrossBps: 150, maxConsecutiveLosses: 3, maxDrawdownUsd: 5000, cooldownSec: 30 };
   const okState = evaluateRisk(fresh, [], 0, 0, Date.now(), cfg, 0);
   check("mercado sano → breaker en reposo", !okState.tripped);
   const aborts = evaluateRisk(fresh, [], 0, 0, Date.now(), cfg, 3);
@@ -305,6 +306,103 @@ console.log("equity:");
     b: { exchange: "b", usd: 500, btc: 0.5 },
   };
   check("totalEquity valúa BTC al precio de referencia", approx(totalEquity(w, 1000), 3000));
+}
+
+console.log("simulador (stepSession):");
+{
+  // Spread moderado (~40 bps, pasa el filtro de anómalos) entre a y b.
+  const mkBooks = (now: number, bidB = 100.4) => {
+    const map: OrderBooks = { a: book("a", 99.9, 100, now), b: book("b", bidB, bidB + 0.5, now) };
+    return { map, merged: [map.a, map.b] };
+  };
+  const wallets2 = (): Record<string, Wallet> => ({
+    a: { exchange: "a", usd: 100_000, btc: 5 },
+    b: { exchange: "b", usd: 100_000, btc: 5 },
+  });
+
+  // Ciclo feliz: tick 1 detecta y deja pendiente; tick 2 re-verifica y llena.
+  {
+    const p = P();
+    const st: SimState = { ...initSimState(p, 1000), wallets: wallets2() };
+    const t1 = mkBooks(1000);
+    const r1 = stepSession(st, t1.map, t1.merged, p, 1000, true);
+    check("tick 1: viable → orden pendiente, sin fills aún", r1.state.pending.length === 1 && r1.state.stats.filledCount === 0);
+    const t2 = mkBooks(2200);
+    const r2 = stepSession(r1.state, t2.map, t2.merged, p, 2200, true);
+    check("tick 2: la pendiente se llena con neto positivo", r2.state.stats.filledCount === 1 && r2.state.pnl > 0);
+    check("P&L = delta de USD en wallets", approx(r2.state.wallets.a.usd + r2.state.wallets.b.usd - 200_000, r2.state.pnl, 1e-6));
+    check("BTC total se conserva", approx(r2.state.wallets.a.btc + r2.state.wallets.b.btc, 10));
+    check("equity registra el tick", r2.state.equity.length === 2);
+    check("no muta el estado previo", r1.state.stats.filledCount === 0);
+  }
+
+  // Spread cerrado en el tick 2 → aborto visible y racha de abortos.
+  {
+    const p = P();
+    const st: SimState = { ...initSimState(p, 1000), wallets: wallets2() };
+    const t1 = mkBooks(1000);
+    const r1 = stepSession(st, t1.map, t1.merged, p, 1000, true);
+    const closed = mkBooks(2200, 99.0); // el bid de b se derrumbó
+    const r2 = stepSession(r1.state, closed.map, closed.merged, p, 2200, true);
+    check("spread cerrado → orden abortada", r2.state.stats.aborted === 1 && r2.state.consecutiveAborts === 1);
+    check("el aborto queda en el ledger", r2.state.trades[0]?.status === "aborted");
+    check("el P&L no se toca en un aborto", approx(r2.state.pnl, 0));
+  }
+
+  // Breaker por abortos → cooldown → auto-rearm.
+  {
+    const p = P({ risk: { ...freshDefaults().risk, maxConsecutiveLosses: 1, cooldownSec: 10 } });
+    const st: SimState = { ...initSimState(p, 1000), wallets: wallets2() };
+    const t1 = mkBooks(1000);
+    const r1 = stepSession(st, t1.map, t1.merged, p, 1000, true);
+    const closed = mkBooks(2200, 99.0);
+    const r2 = stepSession(r1.state, closed.map, closed.merged, p, 2200, true); // aborto → racha 1
+    const t3 = mkBooks(3400);
+    const r3 = stepSession(r2.state, t3.map, t3.merged, p, 3400, true);
+    check("racha ≥ límite → breaker dispara", r3.risk.tripped);
+    check("cooldown programado", r3.state.breakerUntil === 3400 + 10_000);
+    check("con breaker activo no se crean pendientes", r3.state.pending.length === 0);
+    const t4 = mkBooks(14_000);
+    const r4 = stepSession(r3.state, t4.map, t4.merged, p, 14_000, true); // pasado el cooldown
+    check("auto-rearm: el bot se recupera solo", !r4.risk.tripped && r4.state.consecutiveAborts === 0);
+    check("tras el rearm vuelve a crear pendientes", r4.state.pending.length === 1);
+    check("el auto-rearm queda contado (transparencia)", r4.state.stats.autoRearms === 1);
+    check("el auto-rearm suave NO toca el pico de P&L", r4.state.peakPnl === r3.state.peakPnl);
+  }
+
+  // Drawdown es un trip DURO: nunca se auto-rearma — solo intervención manual.
+  {
+    const p = P({ risk: { ...freshDefaults().risk, maxDrawdownUsd: 100, cooldownSec: 10 } });
+    const st: SimState = { ...initSimState(p, 1000), wallets: wallets2(), pnl: -500, peakPnl: 0 };
+    const t1 = mkBooks(1000);
+    const r1 = stepSession(st, t1.map, t1.merged, p, 1000, true);
+    check("drawdown sobre el límite → trip duro", r1.risk.tripped && r1.risk.hard);
+    check("trip duro no programa cooldown", r1.state.breakerUntil === 0);
+    const t2 = mkBooks(120_000);
+    const r2 = stepSession(r1.state, t2.map, t2.merged, p, 120_000, true);
+    check("sigue detenido mucho después (sin auto-rearm)", r2.risk.tripped && r2.state.stats.autoRearms === 0);
+    const t3 = mkBooks(121_200);
+    const r3 = stepSession(rearm(r2.state), t3.map, t3.merged, p, 121_200, true);
+    check("el re-armado manual sí lo levanta", !r3.risk.tripped);
+  }
+
+  // Re-armado manual.
+  {
+    const st = { ...initSimState(P(), 0), consecutiveAborts: 5, breakerUntil: 99_999, pnl: -100, peakPnl: 500 };
+    const re = rearm(st);
+    check("rearm manual: racha 0, pico = P&L, sin cooldown", re.consecutiveAborts === 0 && re.peakPnl === -100 && re.breakerUntil === 0);
+  }
+
+  // Pausa: no ejecuta y cancela pendientes.
+  {
+    const p = P();
+    const st: SimState = { ...initSimState(p, 1000), wallets: wallets2() };
+    const t1 = mkBooks(1000);
+    const r1 = stepSession(st, t1.map, t1.merged, p, 1000, true);
+    const t2 = mkBooks(2200);
+    const r2 = stepSession(r1.state, t2.map, t2.merged, p, 2200, false); // pausado
+    check("pausado: cancela pendientes sin ejecutar", r2.state.pending.length === 0 && r2.state.stats.filledCount === 0);
+  }
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

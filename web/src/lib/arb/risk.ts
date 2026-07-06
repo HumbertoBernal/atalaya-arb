@@ -7,6 +7,7 @@ import type { OrderBook, Opportunity } from "./types";
 
 export type RiskState = {
   tripped: boolean;
+  hard: boolean; // trip por límite de PÉRDIDA (drawdown) → solo re-armado manual
   reasons: string[];
   maxBookAgeMs: number;
 };
@@ -38,9 +39,11 @@ export function evaluateRisk(
     reasons.push(`Spread anómalo ${anomalous.grossBps.toFixed(0)} bps (posible dato corrupto)`);
   }
 
-  // 3) Drawdown: caída desde el pico de P&L por encima del límite.
+  // 3) Drawdown: caída desde el pico de P&L por encima del límite. Es el único
+  //    trip DURO: un límite de pérdida no se auto-rearma — exige decisión humana.
   const drawdown = peakPnl - pnl;
-  if (drawdown > cfg.maxDrawdownUsd) {
+  const hard = drawdown > cfg.maxDrawdownUsd;
+  if (hard) {
     reasons.push(`Drawdown ${drawdown.toFixed(0)} USD > límite`);
   }
 
@@ -50,7 +53,7 @@ export function evaluateRisk(
     reasons.push(`${consecutiveAborts} ejecuciones abortadas seguidas (mercado demasiado rápido)`);
   }
 
-  return { tripped: reasons.length > 0, reasons, maxBookAgeMs: maxAge };
+  return { tripped: reasons.length > 0, hard, reasons, maxBookAgeMs: maxAge };
 }
 
 /** Filtra oportunidades que individualmente parecen corruptas (spread absurdo). */
