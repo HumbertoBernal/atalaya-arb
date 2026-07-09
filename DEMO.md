@@ -86,10 +86,11 @@ Abre la URL. Señala que ya está corriendo en vivo (no es un video). Si aparece
   aborta. Además el costo esperado de adverse selection por latencia se descuenta siempre.
 - **"¿Y los costos de retiro / latencia?"** → Modelados: adverse selection por latencia de red
   (1σ) + withdrawal fee amortizado + fee de red y delay en cada rebalanceo.
-- **"¿Cuál es la mejor configuración?"** → Medido con 5 h de mercado real (tabla en el README):
-  umbral 5 bps ganó (+$81, cero rebalanceos); la agresiva perdió $970 pagando 45 transferencias.
-  El hallazgo: el costo realizado de rebalanceo domina al micro-edge — por eso existen el sizing
-  por inventario y la cadencia mínima, y el P&L se muestra descompuesto en la analítica.
+- **"¿Cuál es la mejor configuración?"** → Medido con 5 h de mercado real (tablas en el README):
+  el preset "Óptimo" (umbral 4 bps + sizing 50%) ganó con +$418; la agresiva (mismo sizing SIN
+  umbral) perdió $1,078. El hallazgo fino: **umbral y sizing interactúan** — primero filtrar
+  calidad, después meterle tamaño. El costo realizado de rebalanceo domina al micro-edge; por
+  eso existen el sizing por inventario y la cadencia mínima, y el P&L va descompuesto en la UI.
 - **"¿Qué pasa si un exchange se cae?"** → Pruébalo en vivo con el modo caos: fallback a REST,
   y si todo queda stale, el circuit breaker detiene la ejecución.
 
