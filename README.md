@@ -210,13 +210,22 @@ No requiere variables de entorno ni API keys: todos los datos son de endpoints p
 | Umbral 10 bps | $0.00 | 0 | 0 | 0 | $0 |
 | Preset Agresivo | **−$970.63** | 330 | 911 | 45 | $1,045 |
 
+Un sweep más fino (umbral × sizing) reveló la estructura del problema:
+
+| | sizing 15% | sizing 25% | sizing 50% |
+|---|---:|---:|---:|
+| **umbral 0 bps** | −$39 | +$31 | **−$1,078** |
+| **umbral 4 bps** | +$67 | +$73 | **+$418** 👑 |
+| **umbral 5 bps** | +$74 | +$81 | +$187 |
+
 **El hallazgo:** el enemigo del micro-arbitraje no son los fees de trading — es el **costo
-realizado de rebalanceo**. La paciencia gana: pocas operaciones gordas (umbral 5 bps) rinden
-más que 30× el volumen (el Agresivo pierde $970 pagando 45 transferencias on-chain), y
-apretar demasiado (10 bps) significa no operar nunca. Por eso el motor incluye **sizing por
-inventario** (máx. % de wallet por orden) y **cadencia mínima de rebalanceo**, y la UI
-descompone el P&L en *ganancia de trading − costos de rebalanceo* para que se vea a dónde
-va cada dólar.
+realizado de rebalanceo** — y **umbral y sizing interactúan**: subir el tamaño sin filtro de
+calidad amplifica basura (−$1,078), pero con umbral de 4 bps es el ganador absoluto (+$418):
+*primero filtrar calidad, después meterle tamaño a lo que pasa el filtro*. Cada fill gordo sí
+cubre su parte del costo on-chain. Esa configuración vive como preset **"Óptimo (sweep 5h)"**
+en el panel y en el Laboratorio. El motor la hace posible con **sizing por inventario** y
+**cadencia mínima de rebalanceo**, y la UI descompone el P&L en *ganancia de trading − costos
+de rebalanceo* para que se vea a dónde va cada dólar.
 
 Reproducible: `pnpm tape 60 && pnpm experiment data/tapes/<cinta>.jsonl --grid`.
 

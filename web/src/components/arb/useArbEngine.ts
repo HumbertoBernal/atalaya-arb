@@ -67,6 +67,7 @@ const LAB_COLORS: Record<LabConfigId, string> = {
   conservador: "#34d399",
   balanceado: "#22d3ee",
   agresivo: "#fbbf24",
+  optimo: "#fb7185",
   actual: "#a78bfa",
 };
 const LAB_SERIES_MAX = 240;

@@ -21,13 +21,14 @@ type Props = {
 const CHOICES: { id: LabConfigId; label: string; color: string; hint: string }[] = [
   { id: "conservador", label: "Conservador", color: "#34d399", hint: "Umbral 5 bps, órdenes chicas, breaker sensible" },
   { id: "balanceado", label: "Balanceado", color: "#22d3ee", hint: "Los defaults del motor" },
-  { id: "agresivo", label: "Agresivo", color: "#fbbf24", hint: "Volumen alto, tolerancia amplia" },
+  { id: "agresivo", label: "Agresivo", color: "#fbbf24", hint: "Volumen alto sin filtro — en el sweep de 5 h perdió $970 (el cuento con moraleja)" },
+  { id: "optimo", label: "Óptimo (sweep 5h)", color: "#fb7185", hint: "Ganador del barrido: umbral 4 bps + sizing 50% → +$418 en 5 h" },
   { id: "actual", label: "Tu config actual", color: "#a78bfa", hint: "Snapshot de tus parámetros de este momento" },
 ];
 
 export function LabPanel({ lab, nowTs, startLab, stopLab, clearLab }: Props) {
   const [open, setOpen] = useState(false);
-  const [selected, setSelected] = useState<LabConfigId[]>(["conservador", "balanceado", "agresivo"]);
+  const [selected, setSelected] = useState<LabConfigId[]>(["optimo", "balanceado", "agresivo"]);
   const hasRuns = lab.runs.length > 0;
 
   const toggle = (id: LabConfigId) =>

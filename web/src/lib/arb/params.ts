@@ -101,7 +101,7 @@ export function freshDefaults(): EngineParams {
 }
 
 // --- Presets de estrategia: puntos de partida con narrativa clara ---
-export type PresetId = "conservador" | "balanceado" | "agresivo";
+export type PresetId = "conservador" | "balanceado" | "agresivo" | "optimo";
 
 export const PRESETS: { id: PresetId; label: string; hint: string; apply: (p: EngineParams) => EngineParams }[] = [
   {
@@ -133,7 +133,7 @@ export const PRESETS: { id: PresetId; label: string; hint: string; apply: (p: En
   {
     id: "agresivo",
     label: "Agresivo",
-    hint: "Volumen alto y tolerancia amplia: más fills, más deriva aceptada.",
+    hint: "Volumen alto y tolerancia amplia: más fills, más deriva aceptada. (En el sweep de 5 h perdió $970 — amplificar trades sin filtro sangra en fees de rebalanceo.)",
     apply: (p) => ({
       ...p,
       minNetBps: 0,
@@ -141,6 +141,18 @@ export const PRESETS: { id: PresetId; label: string; hint: string; apply: (p: En
       maxWalletFrac: 0.5,
       recheckTolBps: 12,
       risk: { ...p.risk, maxDrawdownUsd: 12000, maxConsecutiveLosses: 5 },
+    }),
+  },
+  {
+    id: "optimo",
+    label: "Óptimo (sweep 5h)",
+    hint: "Ganador del barrido sobre 5 h de mercado real: umbral 4 bps + sizing 50% (+$418 vs +$31 de los defaults). Calidad primero, tamaño después.",
+    apply: (p) => ({
+      ...p,
+      minNetBps: 4,
+      maxTradeBtc: DEFAULT_PARAMS.maxTradeBtc,
+      maxWalletFrac: 0.5,
+      recheckTolBps: 5,
     }),
   },
 ];
