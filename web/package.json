@@ -8,8 +8,11 @@
     "start": "next start",
     "lint": "eslint",
     "test": "tsx scripts/test-engine.ts",
+    "test:funding": "tsx scripts/test-funding.ts",
     "tape": "tsx scripts/record-tape.ts",
-    "experiment": "tsx scripts/experiment.ts"
+    "experiment": "tsx scripts/experiment.ts",
+    "funding:fetch": "tsx scripts/funding-fetch.ts",
+    "funding:backtest": "tsx scripts/funding-backtest.ts"
   },
   "dependencies": {
     "next": "16.2.6",
